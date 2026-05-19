@@ -9,6 +9,7 @@ from bilby.gw.detector import PowerSpectralDensity
 from dingo.gw.prior import default_extrinsic_dict
 from dingo.gw.prior import BBHExtrinsicPriorDict
 
+import re
 
 def get_window(window_kwargs):
     """Compute window from window_kwargs."""
@@ -101,7 +102,18 @@ def get_standardization_dict(
     # deviations. If possible, this will either get these, or else it will estimate
     # them numerically.
     ext_prior = BBHExtrinsicPriorDict(extrinsic_prior_dict)
-    mean_extrinsic, std_extrinsic = ext_prior.mean_std(ext_prior.keys())
+    signal_suffixes = infer_signal_suffixes_from_keys(mean_intrinsic.keys())
+    
+    mean_extrinsic = {}
+    std_extrinsic = {}
+    for suffix in signal_suffixes:
+        mean_base, std_base = ext_prior.mean_std(ext_prior.keys())
+
+        for key, value in mean_base.items():
+            mean_extrinsic[f"{key}{suffix}"] = value
+
+        for key, value in std_base.items():
+            std_extrinsic[f"{key}{suffix}"] = value
 
     # Check that overlap between intrinsic and extrinsic parameters is only
     # due to fiducial values (-> std 0)
@@ -144,3 +156,27 @@ def get_standardization_dict(
         "std": {k: std[k] for k in selected_parameters},
     }
     return standardization_dict
+
+
+def infer_signal_suffixes_from_keys(keys):
+    """
+    Infer overlap suffixes from parameter names.
+
+    Examples
+    --------
+    mass_1_A -> _A
+    geocent_time_B -> _B
+
+    Returns
+    -------
+    list[str]
+        Sorted suffixes, e.g. ["_A", "_B"].
+    """
+    suffixes = set()
+
+    for key in keys:
+        match = re.search(r"_[A-Z]$", key)
+        if match is not None:
+            suffixes.add(match.group(0))
+
+    return sorted(suffixes)

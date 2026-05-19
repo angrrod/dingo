@@ -24,8 +24,9 @@ from dingo.gw.waveform_generator import (
     generate_waveforms_parallel,
 )
 from dingo.core.utils.misc import call_func_strict_output_dim
+import string
 
-
+## TODO: deal with overlapping priors by introducing delta_t
 def generate_parameters_and_polarizations(
     waveform_generator: WaveformGenerator,
     prior: BBHPriorDict,
@@ -78,7 +79,6 @@ def generate_parameters_and_polarizations(
         return parameters_ok, polarizations_ok
 
     return parameters, polarizations
-
 
 def train_svd_basis(dataset: WaveformDataset, size: int, n_train: int):
     """
@@ -138,8 +138,7 @@ def train_svd_basis(dataset: WaveformDataset, size: int, n_train: int):
 
     return basis, n_train, n_test
 
-
-def generate_dataset(settings: Dict, num_processes: int) -> WaveformDataset:
+def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1) -> WaveformDataset:
     """
     Generate a waveform dataset.
 
@@ -148,6 +147,7 @@ def generate_dataset(settings: Dict, num_processes: int) -> WaveformDataset:
     settings : dict
         Dictionary of settings to configure the dataset
     num_processes : int
+    num_signals : int
 
     Returns
     -------
@@ -240,16 +240,77 @@ def generate_dataset(settings: Dict, num_processes: int) -> WaveformDataset:
         prior,
         num_processes=num_processes,
     )
-    parameters, polarizations = call_func_strict_output_dim(
-        func, settings["num_samples"]
-    )
+    # ------------------------------------------------------------------
+    # Standard DINGO path: keep this exactly backwards compatible.
+    # ------------------------------------------------------------------
+    if num_signals == 1:
+        parameters, polarizations = call_func_strict_output_dim(
+            func,
+            settings["num_samples"],
+        )
+
+        dataset_dict["parameters"] = parameters
+        dataset_dict["polarizations"] = polarizations
+
+        dataset_dict[settings["num_samples"]] = len(parameters)
+
+        dataset = WaveformDataset(dictionary=dataset_dict)
+        return dataset
+    
+    # ------------------------------------------------------------------
+    # Multi-signal / overlapping-source path.
+    # ------------------------------------------------------------------
+    suffixes = make_signal_suffixes(num_signals)
+    parameter_blocks = []
+    polarization_blocks = {}
+    
+    for signal in range(num_signals):
+        parameters_s, polarizations_s  = call_func_strict_output_dim(
+            func, settings["num_samples"]
+        )
+        suffix = suffixes[signal]
+        parameters_s = parameters_s.reset_index(drop=True)
+        parameter_blocks.append(parameters_s.add_suffix(suffix))
+
+        for key, value in polarizations_s.items():
+            polarization_blocks[f"{key}{suffix}"] = value
+
+    parameters = pd.concat(parameter_blocks, axis=1)
+    
+    overlap_settings = copy.deepcopy(settings)
+    overlap_settings["num_signals"] = num_signals
+    overlap_settings["signal_suffixes"] = suffixes
+    overlap_settings["overlapping_signals"] = True    
+    
+    dataset_dict["settings"] = overlap_settings
     dataset_dict["parameters"] = parameters
-    dataset_dict["polarizations"] = polarizations
+    dataset_dict["polarizations"] = polarization_blocks
 
     dataset_dict[settings["num_samples"]] = len(parameters)
     dataset = WaveformDataset(dictionary=dataset_dict)
+        
     return dataset
 
+def make_signal_suffixes(num_signals: int):
+    """
+    Helper function used for generating suffixes for the naming of multiple signals
+    Args:
+        num_signals (int):  the number of signals
+
+    Raises:
+        ValueError: num_signals  must be strictly larger than 1
+
+    Returns:
+        list: suffixes to be used
+    """
+    if num_signals <= 1:
+        raise ValueError("num_signals must be >= 1")
+
+    if num_signals <= 26:
+        return [f"_{letter}" for letter in string.ascii_uppercase[:num_signals]]
+
+    # Fallback for more than 26 signals.
+    return [f"_S{i}" for i in range(num_signals)]
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -273,6 +334,12 @@ def parse_args():
         help="Number of processes to use in pool for parallel waveform generation",
     )
     parser.add_argument(
+        "--num_signals",
+        type=int,
+        default=1,
+        help="Number of overlapping signals to generate per dataset item. Default: 1.",
+    )
+    parser.add_argument(
         "--out_file",
         type=str,
         default="waveform_dataset.hdf5",
@@ -280,9 +347,8 @@ def parse_args():
     )
     return parser.parse_args()
 
-
 def _generate_dataset_main(
-    settings_file: str, out_file: str, num_processes: int
+    settings_file: str, out_file: str, num_processes: int, num_signals: int = 1
 ) -> None:
     if not Path(settings_file).is_file():
         raise FileNotFoundError(f"dataset generation, failed to find {settings_file}")
@@ -295,13 +361,13 @@ def _generate_dataset_main(
     with open(settings_file, "r") as f:
         settings = yaml.safe_load(f)
 
-    dataset = generate_dataset(settings, num_processes)
+    dataset = generate_dataset(settings, num_processes, num_signals = num_signals)
     dataset.to_file(str(out_file))
 
 
 def main() -> None:
     args = parse_args()
-    _generate_dataset_main(args.settings_file, args.out_file, args.num_processes)
+    _generate_dataset_main(args.settings_file, args.out_file, args.num_processes,args.num_signals)
 
 
 if __name__ == "__main__":

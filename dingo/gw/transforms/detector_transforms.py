@@ -141,6 +141,198 @@ class ProjectOntoDetectors(object):
         self.ref_time = ref_time
 
     def __call__(self, input_sample):
+        if any(key.endswith("_A") for key in input_sample["parameters"]):  #switch between multiple or single signal output, ensure backwards compatibility
+            return self._call_overlapping_signals(input_sample)
+        return self._call_single_signal(input_sample)
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _distance_ratio(d_ref, d_new):
+        """
+        Compute d_ref / d_new with the same broadcasting convention as the
+        original DINGO implementation.
+        """
+        # (1) rescale polarizations and set distance parameter to sampled value
+        if np.isscalar(d_ref) or np.isscalar(d_new):
+            return d_ref / d_new
+
+        if isinstance(d_ref, np.ndarray) and isinstance(d_new, np.ndarray):
+            return (d_ref / d_new)[:, np.newaxis]
+
+        raise ValueError("luminosity_distance should be a float or a numpy array.")
+    
+    def _antenna_patterns(self, ifo, ra, dec, psi):
+        """
+        Compute plus/cross antenna responses.
+
+        This keeps the original non-vectorized loop for batched parameters.
+        """
+        if any(np.isscalar(x) for x in [ra, dec, psi]):
+            fp = ifo.antenna_response(
+                ra, dec, self.ref_time, psi, mode="plus"
+            )
+            fc = ifo.antenna_response(
+                ra, dec, self.ref_time, psi, mode="cross"
+            )
+        else:
+            fp = np.array(
+                [
+                    ifo.antenna_response(
+                        ra_i, dec_i, self.ref_time, psi_i, mode="plus"
+                    )
+                    for ra_i, dec_i, psi_i in zip(ra, dec, psi)
+                ],
+                dtype=np.float32,
+            )
+            fc = np.array(
+                [
+                    ifo.antenna_response(
+                        ra_i, dec_i, self.ref_time, psi_i, mode="cross"
+                    )
+                    for ra_i, dec_i, psi_i in zip(ra, dec, psi)
+                ],
+                dtype=np.float32,
+            )
+            fp = fp[..., np.newaxis]
+            fc = fc[..., np.newaxis]
+
+        return fp, fc
+    
+    def _project_one_signal(
+        self,
+        *,
+        h_cross,
+        h_plus,
+        d_ref,
+        d_new,
+        ra,
+        dec,
+        psi,
+        tc_ref,
+        detector_times,
+    ):
+        """
+        Project one plus/cross polarization pair onto all detectors.
+
+        Returns
+        -------
+        dict
+            Mapping detector name -> frequency-domain detector strain.
+        """
+        assert np.allclose(tc_ref, 0.0), (
+            "This should always be 0. If for some reason "
+            "you want to save time shifted polarizations, "
+            "then remove this assert statement."
+        )
+
+        d_ratio = self._distance_ratio(d_ref, d_new)
+
+        hc = h_cross * d_ratio
+        hp = h_plus * d_ratio
+
+        strains = {}
+
+        for ifo in self.ifo_list:
+            # (2) project strains onto the different detectors
+            # TODO the Bilby cython functions are not vectorized, so for now
+            # we just loop over the extrinsic parameters. This is not ideal
+            # and eventually one should also vectorize these functions to
+            # achieve optimal batching capabilities.
+            fp, fc = self._antenna_patterns(ifo, ra, dec, psi)
+
+            strain = fp * hp + fc * hc
+
+            # (3) time shift the strain. If polarizations are timeshifted by
+            #     tc_ref != 0, undo this here by subtracting it from dt.
+            dt = detector_times[ifo.name] - tc_ref
+            strains[ifo.name] = self.domain.time_translate_data(strain, dt)
+
+        return strains
+    
+    @staticmethod
+    def _sum_strains(total_strains, signal_strains):
+        """
+        Add detector-strain dictionaries.
+
+        Used for overlapping signals:
+            total = signal_A + signal_B + ...
+        """
+        if not total_strains:
+            return dict(signal_strains)
+
+        for ifo_name, strain in signal_strains.items():
+            if ifo_name in total_strains:
+                total_strains[ifo_name] = total_strains[ifo_name] + strain
+            else:
+                total_strains[ifo_name] = strain
+
+        return total_strains
+    
+    @staticmethod
+    def _infer_suffixes_from_parameters(parameters):
+        """
+        Infer signal suffixes from parameter names.
+
+        Example:
+            mass_1_A, mass_1_B -> ["_A", "_B"]
+
+        This intentionally looks only for two-character suffixes of the form
+        _<capital letter>, matching your current naming scheme.
+        """
+        suffixes = sorted(
+            {
+                key[-2:]
+                for key in parameters
+                if len(key) >= 2
+                and key[-2] == "_"
+                and key[-1].isalpha()
+                and key[-1].isupper()
+            }
+        )
+
+        if not suffixes:
+            raise ValueError(
+                "Could not infer overlapping-signal suffixes from parameters. "
+                f"Available parameter keys: {list(parameters.keys())}"
+            )
+
+        return suffixes
+
+    @staticmethod
+    def _get_suffixed(mapping, base_name, suffix, *, allow_unsuffixed_fallback=True):
+        """
+        Get a parameter from a mapping.
+
+        In overlap mode:
+            first try f"{base_name}{suffix}",
+            then optionally fall back to base_name.
+
+        Returns
+        -------
+        value, key_used
+        """
+        suffixed_name = f"{base_name}{suffix}"
+
+        if suffixed_name in mapping:
+            return mapping[suffixed_name], suffixed_name
+
+        if allow_unsuffixed_fallback and base_name in mapping:
+            return mapping[base_name], base_name
+
+        raise KeyError(
+            f"Missing parameter {suffixed_name!r}. "
+            f"Fallback key {base_name!r} "
+            f"{'was also absent' if allow_unsuffixed_fallback else 'was disabled'}."
+        )
+    
+    # ------------------------------------------------------------------
+    # signal projection path
+    # ------------------------------------------------------------------
+
+    def _call_single_signal(self, input_sample):
         sample = input_sample.copy()
         # the line below is required as sample is a shallow copy of
         # input_sample, and we don't want to modify input_sample
@@ -159,54 +351,24 @@ class ProjectOntoDetectors(object):
                 " then remove this assert statement."
             )
             tc_new = extrinsic_parameters.pop("geocent_time")
+            detector_times = {
+                ifo.name: extrinsic_parameters[f"{ifo.name}_time"]
+                for ifo in self.ifo_list
+            }
         except:
             raise ValueError("Missing parameters.")
 
-        # (1) rescale polarizations and set distance parameter to sampled value
-        if np.isscalar(d_ref) or np.isscalar(d_new):
-            d_ratio = d_ref / d_new
-        elif isinstance(d_ref, np.ndarray) and isinstance(d_new, np.ndarray):
-            d_ratio = (d_ref / d_new)[:, np.newaxis]
-        else:
-            raise ValueError("luminosity_distance should be a float or a numpy array.")
-        hc = sample["waveform"]["h_cross"] * d_ratio
-        hp = sample["waveform"]["h_plus"] * d_ratio
-        parameters["luminosity_distance"] = d_new
-
-        strains = {}
-        for ifo in self.ifo_list:
-            # (2) project strains onto the different detectors
-            # TODO the Bilby cython functions are not vectorized, so for now
-            # we just loop over the extrinsic parameters. This is not ideal
-            # and eventually one should also vectorize these functions to
-            # achieve optimal batching capabilities.
-            if any(np.isscalar(x) for x in [ra, dec, psi]):
-                fp = ifo.antenna_response(ra, dec, self.ref_time, psi, mode="plus")
-                fc = ifo.antenna_response(ra, dec, self.ref_time, psi, mode="cross")
-            else:
-                fp = np.array(
-                    [
-                        ifo.antenna_response(ra, dec, self.ref_time, psi, mode="plus")
-                        for ra, dec, psi in zip(ra, dec, psi)
-                    ],
-                    dtype=np.float32,
-                )
-                fc = np.array(
-                    [
-                        ifo.antenna_response(ra, dec, self.ref_time, psi, mode="cross")
-                        for ra, dec, psi in zip(ra, dec, psi)
-                    ],
-                    dtype=np.float32,
-                )
-                fp = fp[..., np.newaxis]
-                fc = fc[..., np.newaxis]
-            strain = fp * hp + fc * hc
-
-            # (3) time shift the strain. If polarizations are timeshifted by
-            #     tc_ref != 0, undo this here by subtracting it from dt.
-            dt = extrinsic_parameters[f"{ifo.name}_time"] - tc_ref
-            strains[ifo.name] = self.domain.time_translate_data(strain, dt)
-
+        strains = self._project_one_signal(
+            h_cross=sample["waveform"]["h_cross"],
+            h_plus=sample["waveform"]["h_plus"],
+            d_ref=d_ref,
+            d_new=d_new,
+            ra=ra,
+            dec=dec,
+            psi=psi,
+            tc_ref=tc_ref,
+            detector_times=detector_times,
+        )
         # Add extrinsic parameters corresponding to the transformations
         # applied in the loop above to parameters. These have all been popped off of
         # extrinsic_parameters, so they only live one place.
@@ -224,7 +386,124 @@ class ProjectOntoDetectors(object):
 
         return sample
 
+    def _call_overlapping_signals(self, input_sample):
+        sample = input_sample.copy()
 
+        parameters = sample["parameters"].copy()
+        extrinsic_parameters = sample["extrinsic_parameters"].copy()
+        waveform = sample["waveform"]
+
+        suffixes = self._infer_suffixes_from_parameters(parameters)
+
+        total_strains = {}
+
+        # We delay popping extrinsic parameters until all signals have been
+        # processed. This matters when unsuffixed extrinsics are shared by A/B.
+        consumed_extrinsic_keys = set()
+
+        for suffix in suffixes:
+            try:
+                d_ref = parameters[f"luminosity_distance{suffix}"]
+                tc_ref = parameters[f"geocent_time{suffix}"]
+
+                d_new, d_new_key = self._get_suffixed(
+                    extrinsic_parameters,
+                    "luminosity_distance",
+                    suffix,
+                    allow_unsuffixed_fallback=True,
+                )
+                ra, ra_key = self._get_suffixed(
+                    extrinsic_parameters,
+                    "ra",
+                    suffix,
+                    allow_unsuffixed_fallback=True,
+                )
+                dec, dec_key = self._get_suffixed(
+                    extrinsic_parameters,
+                    "dec",
+                    suffix,
+                    allow_unsuffixed_fallback=True,
+                )
+                psi, psi_key = self._get_suffixed(
+                    extrinsic_parameters,
+                    "psi",
+                    suffix,
+                    allow_unsuffixed_fallback=True,
+                )
+                tc_new, tc_new_key = self._get_suffixed(
+                    extrinsic_parameters,
+                    "geocent_time",
+                    suffix,
+                    allow_unsuffixed_fallback=True,
+                )
+
+                detector_times = {}
+                detector_time_keys = {}
+
+                for ifo in self.ifo_list:
+                    base_name = f"{ifo.name}_time"
+                    detector_times[ifo.name], detector_time_keys[ifo.name] = (
+                        self._get_suffixed(
+                            extrinsic_parameters,
+                            base_name,
+                            suffix,
+                            allow_unsuffixed_fallback=True,
+                        )
+                    )
+
+                h_cross = waveform[f"h_cross{suffix}"]
+                h_plus = waveform[f"h_plus{suffix}"]
+
+            except Exception as exc:
+                raise ValueError(
+                    f"Missing parameters for overlapping signal {suffix!r}. "
+                    f"Parameter keys: {list(parameters.keys())}. "
+                    f"Extrinsic keys: {list(extrinsic_parameters.keys())}. "
+                    f"Waveform keys: {list(waveform.keys())}."
+                ) from exc
+
+            signal_strains = self._project_one_signal(
+                h_cross=h_cross,
+                h_plus=h_plus,
+                d_ref=d_ref,
+                d_new=d_new,
+                ra=ra,
+                dec=dec,
+                psi=psi,
+                tc_ref=tc_ref,
+                detector_times=detector_times,
+            )
+
+            total_strains = self._sum_strains(total_strains, signal_strains)
+
+            # Store the actually used values under suffixed names, so downstream
+            # code sees a coherent overlap parameterization.
+            parameters[f"luminosity_distance{suffix}"] = d_new
+            parameters[f"ra{suffix}"] = ra
+            parameters[f"dec{suffix}"] = dec
+            parameters[f"psi{suffix}"] = psi
+            parameters[f"geocent_time{suffix}"] = tc_new
+
+            for ifo in self.ifo_list:
+                parameters[f"{ifo.name}_time{suffix}"] = detector_times[ifo.name]
+
+            consumed_extrinsic_keys.update(
+                [d_new_key, ra_key, dec_key, psi_key, tc_new_key]
+            )
+            consumed_extrinsic_keys.update(detector_time_keys.values())
+
+        # Remove extrinsic parameters corresponding to the transformations
+        # applied above. This mirrors the single-signal behavior where these
+        # values are moved from extrinsic_parameters into parameters.
+        for key in consumed_extrinsic_keys:
+            extrinsic_parameters.pop(key, None)
+
+        sample["waveform"] = total_strains
+        sample["parameters"] = parameters
+        sample["extrinsic_parameters"] = extrinsic_parameters
+
+        return sample
+        
 class TimeShiftStrain(object):
     """
     Time shift the strains in the individual detectors according to the

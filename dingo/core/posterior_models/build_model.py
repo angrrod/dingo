@@ -2,6 +2,7 @@ from dingo.core.posterior_models.base_model import BasePosteriorModel
 from dingo.core.posterior_models.flow_matching import FlowMatchingPosteriorModel
 from dingo.core.posterior_models.normalizing_flow import NormalizingFlowPosteriorModel
 from dingo.core.posterior_models.score_matching import ScoreDiffusionPosteriorModel
+from dingo.core.posterior_models.Copula_Model import CopulaNormalizingFlowModel
 from dingo.core.utils.backward_compatibility import (
     torch_load_with_fallback,
     update_model_config,
@@ -40,6 +41,7 @@ def build_model_from_kwargs(
         "normalizing_flow": NormalizingFlowPosteriorModel,
         "flow_matching": FlowMatchingPosteriorModel,
         "score_matching": ScoreDiffusionPosteriorModel,
+        "copula_normalizing_flow" : CopulaNormalizingFlowModel
     }
 
     if filename is not None:

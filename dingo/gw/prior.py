@@ -41,7 +41,7 @@ class BBHExtrinsicPriorDict(BBHPriorDict):
 
         return out_sample
 
-    def mean_std(self, keys=([]), sample_size=50000, force_numerical=False):
+    def mean_std(self, keys=([]), sample_size=50000, force_numerical=False, signal_suffixes=None):
         """
         Calculate the mean and standard deviation over the prior.
 
@@ -95,9 +95,8 @@ class BBHExtrinsicPriorDict(BBHPriorDict):
                 if key in samples.keys():
                     mean[key] = np.mean(samples[key]).item()
                     std[key] = np.std(samples[key]).item()
-
+        
         return mean, std
-
 
 default_extrinsic_dict = {
     "dec": "bilby.core.prior.Cosine(minimum=-np.pi/2, maximum=np.pi/2, name='dec')",
