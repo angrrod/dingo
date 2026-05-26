@@ -27,12 +27,16 @@ def get_window(window_kwargs):
         raise NotImplementedError(f"Unknown window type {type}.")
 
 
-def get_extrinsic_prior_dict(extrinsic_prior):
+def get_extrinsic_prior_dict(extrinsic_prior, joint=False):
     """Build dict for extrinsic prior by starting with
     default_extrinsic_dict, and overwriting every element for which
     extrinsic_prior is not default.
     TODO: Move to dingo.gw.prior.py?"""
-    extrinsic_prior_dict = default_extrinsic_dict.copy()
+    if joint:
+        extrinsic_prior_dict = {}
+    else:
+        extrinsic_prior_dict = default_extrinsic_dict.copy()
+        print("!!!!!!!! getting one signal prior check overlap") #TODO: remove
     for k, v in extrinsic_prior.items():
         if v.lower() != "default":
             extrinsic_prior_dict[k] = v

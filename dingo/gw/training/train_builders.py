@@ -97,8 +97,11 @@ def set_train_transforms(wfd, data_settings, asd_dataset_path, omit_transforms=N
     )
     assert wfd.domain == asd_dataset.domain
     domain = wfd.domain
-
-    extrinsic_prior_dict = get_extrinsic_prior_dict(data_settings["extrinsic_prior"])
+    
+    extrinsic_prior = data_settings["extrinsic_prior"]
+    isJoint = is_joint_extrinsic_prior(extrinsic_prior)
+    extrinsic_prior_dict = get_extrinsic_prior_dict(extrinsic_prior,isJoint)
+    
     if data_settings["inference_parameters"] == "default":
         data_settings["inference_parameters"] = default_inference_parameters
 
@@ -106,11 +109,12 @@ def set_train_transforms(wfd, data_settings, asd_dataset_path, omit_transforms=N
     # Build detector objects
     ifo_list = InterferometerList(data_settings["detectors"])
 
-    # Build transforms.
-    transforms = [
-        SampleExtrinsicParameters(extrinsic_prior_dict),
-        GetDetectorTimes(ifo_list, ref_time),
-    ]
+    if isJoint:
+        # Build transforms.
+        transforms = [
+            SampleExtrinsicParameters(extrinsic_prior_dict,isJoint),
+            GetDetectorTimes(ifo_list, ref_time),
+        ]
 
     extra_context_parameters = []
     if "gnpe_time_shifts" in data_settings:
@@ -190,6 +194,23 @@ def set_train_transforms(wfd, data_settings, asd_dataset_path, omit_transforms=N
 
     wfd.transform = torchvision.transforms.Compose(transforms)
 
+# TODO:consolidat with others
+def is_joint_extrinsic_prior(extrinsic_prior):
+    """
+    Detect whether the extrinsic prior is for a two-signal/joint setup.
+
+    This assumes the joint convention:
+        parameter_A
+        parameter_B
+        delta_t_AB
+    """
+    keys = set(extrinsic_prior.keys())
+
+    has_suffix_A = any(k.endswith("_A") for k in keys)
+    has_suffix_B = any(k.endswith("_B") for k in keys)
+    has_delta = "delta_t_AB" in keys
+
+    return has_suffix_A or has_suffix_B or has_delta
 
 def build_svd_for_embedding_network(
     wfd: WaveformDataset,
@@ -241,6 +262,7 @@ def build_svd_for_embedding_network(
     torch.multiprocessing.set_sharing_strategy("file_system")
 
     # Fix the luminosity distance to a standard value, just in order to generate the SVD.
+    # TODO: fix?
     data_settings["extrinsic_prior"]["luminosity_distance"] = "100.0"
 
     # Build the dataset, but with certain transforms omitted. In particular, we want to

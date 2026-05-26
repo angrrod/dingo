@@ -17,7 +17,7 @@ import logging
 logging.getLogger("bilby").setLevel("ERROR")
 
 
-class BBHExtrinsicPriorDict(BBHPriorDict):
+class BBHExtrinsicPriorDict(BBHPriorDict):   # modeIsSingle
     """
     This class is the same as BBHPriorDict except that it does not require mass parameters.
 

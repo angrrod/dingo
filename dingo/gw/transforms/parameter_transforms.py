@@ -3,17 +3,20 @@ import torch
 import pandas as pd
 from dingo.gw.prior import BBHExtrinsicPriorDict
 from .utils import get_batch_size_of_input_sample
-
+from bilby.core.prior import PriorDict
 
 class SampleExtrinsicParameters(object):
     """
     Sample extrinsic parameters and add them to sample in a separate dictionary.
     """
 
-    def __init__(self, extrinsic_prior_dict):
+    def __init__(self, extrinsic_prior_dict, modeIsSingle:bool = "single"):
         self.extrinsic_prior_dict = extrinsic_prior_dict
-        self.prior = BBHExtrinsicPriorDict(extrinsic_prior_dict)
-
+        self.modeIsSingle = modeIsSingle
+        self.prior = BBHExtrinsicPriorDict(
+            extrinsic_prior_dict,
+            modeIsSingle=modeIsSingle,
+        )
     def __call__(self, input_sample):
         sample = input_sample.copy()
         batched, batch_size = get_batch_size_of_input_sample(input_sample)
@@ -29,7 +32,7 @@ class SampleExtrinsicParameters(object):
     def reproduction_dict(self):
         return {"extrinsic_prior_dict": self.extrinsic_prior_dict}
 
-
+    
 class SelectStandardizeRepackageParameters(object):
     """
     This transformation selects the parameters in standardization_dict,

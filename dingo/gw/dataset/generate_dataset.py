@@ -25,6 +25,7 @@ from dingo.gw.waveform_generator import (
 )
 from dingo.core.utils.misc import call_func_strict_output_dim
 import string
+import re
 
 ## TODO: deal with overlapping priors by introducing delta_t
 def generate_parameters_and_polarizations(
@@ -49,23 +50,37 @@ def generate_parameters_and_polarizations(
     dictionary of numpy arrays corresponding to waveform polarizations
     """
     print("Generating dataset of size " + str(num_samples))
-    parameters = pd.DataFrame(prior.sample(num_samples))
+    parameters      = pd.DataFrame(prior.sample(num_samples))
+    parameters      = _break_symmetry(parameters)
+    
+    suffixes        = _extract_signal_suffixes(parameters.columns)
+    splitted_params = _split_by_suffix(parameters,suffixes)
+    
+    polarization_blocks = {}
+    failed_masks = []
+    for suffix,parameters_split in splitted_params.items():
+        if num_processes > 1:
+            with threadpool_limits(limits=1, user_api="blas"):
+                with Pool(processes=num_processes) as pool:
+                    polarizations_split  = generate_waveforms_parallel(
+                        waveform_generator, parameters_split, pool
+                    )
+        else:
+            polarizations_split  = generate_waveforms_parallel(waveform_generator, parameters_split)
+        
+        polarization_blocks[suffix] = polarizations_split
+        
+        # Find cases where waveform generation failed and only return data for successful ones
+        wf_failed_s = np.any(np.isnan(polarizations_split["h_plus"]), axis=1)
+        failed_masks.append(wf_failed_s)
 
-    if num_processes > 1:
-        with threadpool_limits(limits=1, user_api="blas"):
-            with Pool(processes=num_processes) as pool:
-                polarizations = generate_waveforms_parallel(
-                    waveform_generator, parameters, pool
-                )
-    else:
-        polarizations = generate_waveforms_parallel(waveform_generator, parameters)
-
-    # Find cases where waveform generation failed and only return data for successful ones
-    wf_failed = np.any(np.isnan(polarizations["h_plus"]), axis=1)
+    # A joint sample fails if any of its component waveforms failed.
+    wf_failed           = np.logical_or.reduce(failed_masks)
+    polarizations_joint = _recombine_polarizations_with_suffix(polarization_blocks)
     if wf_failed.any():
         idx_failed = np.where(wf_failed)[0]
         idx_ok = np.where(~wf_failed)[0]
-        polarizations_ok = {k: v[idx_ok] for k, v in polarizations.items()}
+        polarizations_ok = {k: v[idx_ok] for k, v in polarizations_joint.items()}
         parameters_ok = parameters.iloc[idx_ok]
         failed_percent = 100 * len(idx_failed) / len(parameters)
         print(
@@ -77,8 +92,80 @@ def generate_parameters_and_polarizations(
             f"Only returning the {len(idx_ok)} successfully generated configurations."
         )
         return parameters_ok, polarizations_ok
+    return parameters, polarizations_joint
 
-    return parameters, polarizations
+def _recombine_polarizations_with_suffix(
+    polarization_blocks: dict[str, dict[str, np.ndarray]],
+) -> dict[str, np.ndarray]:
+    out = {}
+
+    for suffix, polarizations in polarization_blocks.items():
+        for key, value in polarizations.items():
+            out[f"{key}{suffix}"] = value
+
+    return out
+
+def _break_symmetry(parameters):
+    #break symmetry for overlapping signals
+    parameters["geocent_time_B"] = (
+        parameters["geocent_time_A"] + parameters["delta_t_AB"]
+    )
+    parameters = parameters.drop(columns=["delta_t_AB"]) #remove old column
+    return parameters
+
+def _extract_signal_suffixes(columns, pattern=r"_[A-Z]$"):
+    """
+    Extract signal suffixes from parameter names.
+
+    Example:
+        ["mass_1_A", "mass_1_B", "delta_t_AB"]
+        -> ["_A", "_B"]
+
+    Joint parameters like delta_t_AB are ignored because they do not end
+    in a single signal suffix.
+    """
+    suffixes = set()
+
+    for col in columns:
+        match = re.search(pattern, col)
+        if match is not None:
+            suffixes.add(match.group(0))
+
+    return sorted(suffixes)
+
+def _split_by_suffix(df: pd.DataFrame, suffixes=None) -> dict[str, pd.DataFrame]:
+    """
+    Split a joint suffixed DataFrame into unsuffixed sub-DataFrames.
+
+    Example:
+        mass_1_A, mass_2_A -> mass_1, mass_2
+        mass_1_B, mass_2_B -> mass_1, mass_2
+
+    Returns:
+        {
+            "_A": df_A_unsuffixed,
+            "_B": df_B_unsuffixed,
+        }
+    """
+    if suffixes is None:
+        suffixes = _extract_signal_suffixes(df.columns)
+
+    out = {}
+
+    for suffix in suffixes:
+        cols = [c for c in df.columns if c.endswith(suffix)]
+
+        if not cols:
+            raise ValueError(f"No columns found for suffix {suffix!r}.")
+
+        rename = {
+            c: c[:-len(suffix)]
+            for c in cols
+        }
+
+        out[suffix] = df[cols].rename(columns=rename).copy()
+
+    return out
 
 def train_svd_basis(dataset: WaveformDataset, size: int, n_train: int):
     """
@@ -260,33 +347,23 @@ def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1) ->
     # ------------------------------------------------------------------
     # Multi-signal / overlapping-source path.
     # ------------------------------------------------------------------
-    suffixes = make_signal_suffixes(num_signals)
-    parameter_blocks = []
-    polarization_blocks = {}
-    
-    for signal in range(num_signals):
-        parameters_s, polarizations_s  = call_func_strict_output_dim(
-            func, settings["num_samples"]
-        )
-        suffix = suffixes[signal]
-        parameters_s = parameters_s.reset_index(drop=True)
-        parameter_blocks.append(parameters_s.add_suffix(suffix))
+    parameters, polarizations = call_func_strict_output_dim(
+        func,
+        settings["num_samples"],
+    )
 
-        for key, value in polarizations_s.items():
-            polarization_blocks[f"{key}{suffix}"] = value
-
-    parameters = pd.concat(parameter_blocks, axis=1)
     
     overlap_settings = copy.deepcopy(settings)
     overlap_settings["num_signals"] = num_signals
-    overlap_settings["signal_suffixes"] = suffixes
+    overlap_settings["signal_suffixes"] = make_signal_suffixes(num_signals)
     overlap_settings["overlapping_signals"] = True    
     
     dataset_dict["settings"] = overlap_settings
     dataset_dict["parameters"] = parameters
-    dataset_dict["polarizations"] = polarization_blocks
+    dataset_dict["polarizations"] = polarizations
+    dataset_dict["num_samples"] = len(parameters)
 
-    dataset_dict[settings["num_samples"]] = len(parameters)
+    dataset = WaveformDataset(dictionary=dataset_dict)
     dataset = WaveformDataset(dictionary=dataset_dict)
         
     return dataset
