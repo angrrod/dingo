@@ -99,7 +99,7 @@ def set_train_transforms(wfd, data_settings, asd_dataset_path, omit_transforms=N
     domain = wfd.domain
     
     extrinsic_prior = data_settings["extrinsic_prior"]
-    isJoint = is_joint_extrinsic_prior(extrinsic_prior)
+    isJoint = is_joint_extrinsic_prior(extrinsic_prior) #TODO:: fix this 
     extrinsic_prior_dict = get_extrinsic_prior_dict(extrinsic_prior,isJoint)
     
     if data_settings["inference_parameters"] == "default":
@@ -111,9 +111,10 @@ def set_train_transforms(wfd, data_settings, asd_dataset_path, omit_transforms=N
 
     if isJoint:
         # Build transforms.
+        isSingle = not isJoint
         transforms = [
-            SampleExtrinsicParameters(extrinsic_prior_dict,isJoint),
-            GetDetectorTimes(ifo_list, ref_time),
+            SampleExtrinsicParameters(extrinsic_prior_dict,isSingle),
+            GetDetectorTimes(ifo_list, ref_time,isSingle),
         ]
 
     extra_context_parameters = []
@@ -148,12 +149,14 @@ def set_train_transforms(wfd, data_settings, asd_dataset_path, omit_transforms=N
         standardization_dict = data_settings["standardization"]
         print("Using previously-calculated parameter standardizations.")
     except KeyError:
+        modeIsSingle = not is_joint_extrinsic_prior(extrinsic_prior_dict)
         print("Calculating new parameter standardizations.")
         standardization_dict = get_standardization_dict(
             extrinsic_prior_dict,
             wfd,
             data_settings["inference_parameters"] + data_settings["context_parameters"],
             torchvision.transforms.Compose(transforms),
+            modeIsSingle
         )
         data_settings["standardization"] = standardization_dict
 
@@ -194,7 +197,7 @@ def set_train_transforms(wfd, data_settings, asd_dataset_path, omit_transforms=N
 
     wfd.transform = torchvision.transforms.Compose(transforms)
 
-# TODO:consolidat with others
+# TODO:: consolidat with others
 def is_joint_extrinsic_prior(extrinsic_prior):
     """
     Detect whether the extrinsic prior is for a two-signal/joint setup.
@@ -262,7 +265,6 @@ def build_svd_for_embedding_network(
     torch.multiprocessing.set_sharing_strategy("file_system")
 
     # Fix the luminosity distance to a standard value, just in order to generate the SVD.
-    # TODO: fix?
     data_settings["extrinsic_prior"]["luminosity_distance"] = "100.0"
 
     # Build the dataset, but with certain transforms omitted. In particular, we want to

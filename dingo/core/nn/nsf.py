@@ -207,6 +207,7 @@ class FlowWrapper(nn.Module):
         self.flow = flow
 
     def log_prob(self, y, *x):
+        x = x[0]
         if len(x) > 0:
             if self.embedding_net is not None:
                 x = self.embedding_net(*x)
@@ -216,6 +217,7 @@ class FlowWrapper(nn.Module):
             return self.flow.log_prob(y)
 
     def sample(self, *x, num_samples=1):
+        x = x[0]
         if len(x) > 0:
             if self.embedding_net is not None:
                 x = self.embedding_net(*x)
@@ -225,6 +227,7 @@ class FlowWrapper(nn.Module):
             return self.flow.sample(num_samples)
 
     def sample_and_log_prob(self, *x, num_samples=1):
+        x = x[0]
         if len(x) > 0:
             if self.embedding_net is not None:
                 x = self.embedding_net(*x)

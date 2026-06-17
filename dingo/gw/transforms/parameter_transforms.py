@@ -10,9 +10,10 @@ class SampleExtrinsicParameters(object):
     Sample extrinsic parameters and add them to sample in a separate dictionary.
     """
 
-    def __init__(self, extrinsic_prior_dict, modeIsSingle:bool = "single"):
+    def __init__(self, extrinsic_prior_dict, modeIsSingle:bool = True):
         self.extrinsic_prior_dict = extrinsic_prior_dict
         self.modeIsSingle = modeIsSingle
+        print(f"$$$ SampleExtrinsicParameters modeIsSingle: {modeIsSingle}")
         self.prior = BBHExtrinsicPriorDict(
             extrinsic_prior_dict,
             modeIsSingle=modeIsSingle,

@@ -36,7 +36,7 @@ def get_extrinsic_prior_dict(extrinsic_prior, joint=False):
         extrinsic_prior_dict = {}
     else:
         extrinsic_prior_dict = default_extrinsic_dict.copy()
-        print("!!!!!!!! getting one signal prior check overlap") #TODO: remove
+        print("!!!!!!!! getting one signal prior check overlap") # TODO:: remove
     for k, v in extrinsic_prior.items():
         if v.lower() != "default":
             extrinsic_prior_dict[k] = v
@@ -78,7 +78,7 @@ def get_mismatch(a, b, domain, asd_file=None):
 
 
 def get_standardization_dict(
-    extrinsic_prior_dict, wfd, selected_parameters, transform=None
+    extrinsic_prior_dict, wfd, selected_parameters, transform=None, modeIsSingle:bool = True
 ):
     """
     Calculates the mean and standard deviation of parameters. This is needed for
@@ -105,19 +105,34 @@ def get_standardization_dict(
     # Some of the extrinsic prior parameters have analytic means and standard
     # deviations. If possible, this will either get these, or else it will estimate
     # them numerically.
-    ext_prior = BBHExtrinsicPriorDict(extrinsic_prior_dict)
+    ext_prior = BBHExtrinsicPriorDict(extrinsic_prior_dict,modeIsSingle = modeIsSingle)
     signal_suffixes = infer_signal_suffixes_from_keys(mean_intrinsic.keys())
     
     mean_extrinsic = {}
     std_extrinsic = {}
-    for suffix in signal_suffixes:
-        mean_base, std_base = ext_prior.mean_std(ext_prior.keys())
+    ext_prior_has_suffixes = any(
+        key.endswith("_A") or key.endswith("_B")
+        for key in ext_prior.keys()
+    )
+    mean_base, std_base = ext_prior.mean_std(ext_prior.keys())
 
-        for key, value in mean_base.items():
-            mean_extrinsic[f"{key}{suffix}"] = value
+    if ext_prior_has_suffixes:
+        # Joint mode: extrinsic prior already has keys like
+        # luminosity_distance_A, luminosity_distance_B, ra_A, ra_B, ...
+        # Therefore do not append suffixes again.
+        mean_extrinsic = mean_base
+        std_extrinsic = std_base
 
-        for key, value in std_base.items():
-            std_extrinsic[f"{key}{suffix}"] = value
+    else:
+        # Single-prior / shared-prior mode: extrinsic prior has unsuffixed keys like
+        # luminosity_distance, ra, dec, ...
+        # Replicate them over the waveform dataset suffixes.
+        for suffix in signal_suffixes:
+            for key, value in mean_base.items():
+                mean_extrinsic[f"{key}{suffix}"] = value
+
+            for key, value in std_base.items():
+                std_extrinsic[f"{key}{suffix}"] = value
 
     # Check that overlap between intrinsic and extrinsic parameters is only
     # due to fiducial values (-> std 0)

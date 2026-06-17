@@ -95,11 +95,19 @@ class GetDetectorTimes(object):
     position (ra, dec), the geocent_time and the ref_time.
     """
 
-    def __init__(self, ifo_list, ref_time):
+    def __init__(self, ifo_list, ref_time, isSingle:bool = True):
         self.ifo_list = ifo_list
         self.ref_time = ref_time
+        self.isSingle = isSingle
+        print(f'$$$ GetDetectorTimes: isSingle {isSingle}')
 
     def __call__(self, input_sample):
+        if self.isSingle:
+            return self._call_single(input_sample)
+        else:
+            return self._call_joint(input_sample)
+
+    def _call_single(self, input_sample):
         sample = input_sample.copy()
         # the line below is required as sample is a shallow copy of
         # input_sample, and we don't want to modify input_sample
@@ -108,18 +116,57 @@ class GetDetectorTimes(object):
         dec = extrinsic_parameters["dec"]
         geocent_time = extrinsic_parameters["geocent_time"]
         for ifo in self.ifo_list:
-            if type(ra) == torch.Tensor:
-                # computation does not work on gpu, so do it on cpu
-                ra = ra.cpu()
-                dec = dec.cpu()
-            dt = time_delay_from_geocenter(ifo, ra, dec, self.ref_time)
-            if type(dt) == torch.Tensor:
-                dt = dt.to(geocent_time.device)
-            ifo_time = geocent_time + dt
-            extrinsic_parameters[f"{ifo.name}_time"] = ifo_time
+            extrinsic_parameters[f"{ifo.name}_time"] = self._compute_ifo_time(ra,dec,ifo,geocent_time)
+        sample["extrinsic_parameters"] = extrinsic_parameters
+        return sample
+    
+    def _call_joint(self, input_sample):
+        sample = input_sample.copy()
+
+        # Shallow-copy protection.
+        extrinsic_parameters = sample["extrinsic_parameters"].copy()
+
+        suffixes = ["_A","_B"]
+        if suffixes is None:
+            suffixes = self._infer_signal_suffixes(extrinsic_parameters)
+
+        for suffix in suffixes:
+            ra_key = f"ra{suffix}"
+            dec_key = f"dec{suffix}"
+            time_key = f"geocent_time{suffix}"
+
+            missing = [
+                key for key in [ra_key, dec_key, time_key]
+                if key not in extrinsic_parameters
+            ]
+
+            if missing:
+                raise KeyError(
+                    f"Missing keys for joint detector-time computation "
+                    f"for suffix {suffix}: {missing}. "
+                    f"Available keys are: {list(extrinsic_parameters.keys())}"
+                )
+
+            ra = extrinsic_parameters[ra_key]
+            dec = extrinsic_parameters[dec_key]
+            geocent_time = extrinsic_parameters[time_key]
+
+            for ifo in self.ifo_list:
+                extrinsic_parameters[f"{ifo.name}_time{suffix}"] = self._compute_ifo_time(ra,dec,ifo,geocent_time)
+
         sample["extrinsic_parameters"] = extrinsic_parameters
         return sample
 
+    def _compute_ifo_time(self,ra,dec,ifo,geocent_time):
+        if type(ra) == torch.Tensor:
+            # computation does not work on gpu, so do it on cpu
+            ra = ra.cpu()
+            dec = dec.cpu()
+        dt = time_delay_from_geocenter(ifo, ra, dec, self.ref_time)
+        if type(dt) == torch.Tensor:
+            dt = dt.to(geocent_time.device)
+        ifo_time = geocent_time + dt
+        return ifo_time
 
 class ProjectOntoDetectors(object):
     """

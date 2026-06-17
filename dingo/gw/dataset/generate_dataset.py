@@ -27,12 +27,12 @@ from dingo.core.utils.misc import call_func_strict_output_dim
 import string
 import re
 
-## TODO: deal with overlapping priors by introducing delta_t
 def generate_parameters_and_polarizations(
     waveform_generator: WaveformGenerator,
     prior: BBHPriorDict,
     num_samples: int,
     num_processes: int,
+    num_signals:int = 1
 ) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
     """
     Generate a dataset of waveforms based on parameters drawn from the prior.
@@ -43,6 +43,7 @@ def generate_parameters_and_polarizations(
     prior : Prior
     num_samples : int
     num_processes : int
+    num_signals : int the amount of signals, default = 1
 
     Returns
     -------
@@ -51,10 +52,10 @@ def generate_parameters_and_polarizations(
     """
     print("Generating dataset of size " + str(num_samples))
     parameters      = pd.DataFrame(prior.sample(num_samples))
-    parameters      = _break_symmetry(parameters)
-    
-    suffixes        = _extract_signal_suffixes(parameters.columns)
-    splitted_params = _split_by_suffix(parameters,suffixes)
+    if num_signals > 1:
+        parameters      = _break_symmetry(parameters)
+    suffixes        = _extract_signal_suffixes(parameters.columns,num_signals = num_signals)
+    splitted_params = _split_by_suffix(parameters,suffixes,num_signals = num_signals)
     
     polarization_blocks = {}
     failed_masks = []
@@ -76,7 +77,7 @@ def generate_parameters_and_polarizations(
 
     # A joint sample fails if any of its component waveforms failed.
     wf_failed           = np.logical_or.reduce(failed_masks)
-    polarizations_joint = _recombine_polarizations_with_suffix(polarization_blocks)
+    polarizations_joint = _recombine_polarizations_with_suffix(polarization_blocks,num_signals = num_signals)
     if wf_failed.any():
         idx_failed = np.where(wf_failed)[0]
         idx_ok = np.where(~wf_failed)[0]
@@ -96,7 +97,10 @@ def generate_parameters_and_polarizations(
 
 def _recombine_polarizations_with_suffix(
     polarization_blocks: dict[str, dict[str, np.ndarray]],
+    num_signals = 1
 ) -> dict[str, np.ndarray]:
+    if num_signals == 1:
+       return polarization_blocks.get("")
     out = {}
 
     for suffix, polarizations in polarization_blocks.items():
@@ -113,7 +117,7 @@ def _break_symmetry(parameters):
     parameters = parameters.drop(columns=["delta_t_AB"]) #remove old column
     return parameters
 
-def _extract_signal_suffixes(columns, pattern=r"_[A-Z]$"):
+def _extract_signal_suffixes(columns, pattern=r"_[A-Z]$",num_signals = 1):
     """
     Extract signal suffixes from parameter names.
 
@@ -123,7 +127,10 @@ def _extract_signal_suffixes(columns, pattern=r"_[A-Z]$"):
 
     Joint parameters like delta_t_AB are ignored because they do not end
     in a single signal suffix.
+    default to set of empty suffix str if number of signals  = 1
     """
+    if num_signals == 1:
+        return sorted(set(""))
     suffixes = set()
 
     for col in columns:
@@ -133,7 +140,7 @@ def _extract_signal_suffixes(columns, pattern=r"_[A-Z]$"):
 
     return sorted(suffixes)
 
-def _split_by_suffix(df: pd.DataFrame, suffixes=None) -> dict[str, pd.DataFrame]:
+def _split_by_suffix(df: pd.DataFrame, suffixes=None,num_signals = 1) -> dict[str, pd.DataFrame]:
     """
     Split a joint suffixed DataFrame into unsuffixed sub-DataFrames.
 
@@ -147,9 +154,13 @@ def _split_by_suffix(df: pd.DataFrame, suffixes=None) -> dict[str, pd.DataFrame]
             "_B": df_B_unsuffixed,
         }
     """
+    
+    if num_signals == 1:
+        return {df}
+    
     if suffixes is None:
         suffixes = _extract_signal_suffixes(df.columns)
-
+    
     out = {}
 
     for suffix in suffixes:
@@ -326,47 +337,43 @@ def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1) ->
         waveform_generator,
         prior,
         num_processes=num_processes,
+        num_signals=num_signals
     )
+    
+    parameters, polarizations = call_func_strict_output_dim(
+        func,
+        settings["num_samples"],
+    )
+    
     # ------------------------------------------------------------------
     # Standard DINGO path: keep this exactly backwards compatible.
     # ------------------------------------------------------------------
     if num_signals == 1:
-        parameters, polarizations = call_func_strict_output_dim(
-            func,
-            settings["num_samples"],
-        )
-
+        
         dataset_dict["parameters"] = parameters
         dataset_dict["polarizations"] = polarizations
-
         dataset_dict[settings["num_samples"]] = len(parameters)
-
         dataset = WaveformDataset(dictionary=dataset_dict)
         return dataset
     
     # ------------------------------------------------------------------
     # Multi-signal / overlapping-source path.
     # ------------------------------------------------------------------
-    parameters, polarizations = call_func_strict_output_dim(
-        func,
-        settings["num_samples"],
-    )
-
     
-    overlap_settings = copy.deepcopy(settings)
-    overlap_settings["num_signals"] = num_signals
-    overlap_settings["signal_suffixes"] = make_signal_suffixes(num_signals)
-    overlap_settings["overlapping_signals"] = True    
-    
-    dataset_dict["settings"] = overlap_settings
-    dataset_dict["parameters"] = parameters
-    dataset_dict["polarizations"] = polarizations
-    dataset_dict["num_samples"] = len(parameters)
-
-    dataset = WaveformDataset(dictionary=dataset_dict)
-    dataset = WaveformDataset(dictionary=dataset_dict)
+    else:         
+        overlap_settings = copy.deepcopy(settings)
+        overlap_settings["num_signals"] = num_signals
+        overlap_settings["signal_suffixes"] = make_signal_suffixes(num_signals)
+        overlap_settings["overlapping_signals"] = True    
         
-    return dataset
+        dataset_dict["settings"] = overlap_settings
+        dataset_dict["parameters"] = parameters
+        dataset_dict["polarizations"] = polarizations
+        dataset_dict["num_samples"] = len(parameters)
+
+        dataset = WaveformDataset(dictionary=dataset_dict)
+            
+        return dataset
 
 def make_signal_suffixes(num_signals: int):
     """
@@ -441,11 +448,9 @@ def _generate_dataset_main(
     dataset = generate_dataset(settings, num_processes, num_signals = num_signals)
     dataset.to_file(str(out_file))
 
-
 def main() -> None:
     args = parse_args()
     _generate_dataset_main(args.settings_file, args.out_file, args.num_processes,args.num_signals)
-
 
 if __name__ == "__main__":
     main()

@@ -12,7 +12,7 @@ class CopulaNSFFlowWrapper(nn.Module):
     """
     similar to flowrapper, but for multiple flows
     """
-    # TODO: extend to N signals
+    # TODO:: extend to N signals
     def __init__(self, posterior_kwargs, embedding_kwargs, initial_weights=None):
         super().__init__()
         
@@ -75,7 +75,7 @@ class CopulaNSFFlowWrapper(nn.Module):
         else:
             return self.log_prob(y)
         
-#TODO: remove debug options
+#TODO:: new version -> after test?
 class VectorCopulaModel(nn.Module):
     arg_constraints = {}  # fill if you have constrained params
     support         = constraints.real_vector
@@ -118,7 +118,7 @@ class VectorCopulaModel(nn.Module):
         with torch.no_grad():
             return self.rsample(context,num_samples)
         
-    #TODO: is context batched? -> can cause issues to be checke later
+    #TODO:: is context batched? -> can cause issues to be checked later
     def _buildOmega(self,context):
         B, zeta = self.copulaNet(context)
 
@@ -166,8 +166,8 @@ class VectorCopulaModel(nn.Module):
             logp_marg_1 = self.flow_1.log_prob(theta0, context)
             logp_marg_2 = self.flow_2.log_prob(theta1, context)
             #generate input for log prob copula
-            Q_1 = self.flow_1.flow._transform.inverse(theta0, context=context)
-            Q_2 = self.flow_2.flow._transform.inverse(theta1, context=context)
+            Q_1,_ = self.flow_1.flow._transform.inverse(theta0, context=context)
+            Q_2,_ = self.flow_2.flow._transform.inverse(theta1, context=context)
             
         if len(theta.shape) == 2:
             dim = 1
@@ -175,7 +175,7 @@ class VectorCopulaModel(nn.Module):
             dim = 0
         Q = torch.concat([Q_1,Q_2],dim = dim)
         
-        # TODO: fix logprobCopulas conditional
+        # TODO:: fix logprobCopulas conditional
         logDensity,logDetTerm,logCopulaTerm  = self._logProbCopula(Q,context)
         total = logp_marg_1 + logp_marg_2 + logDensity
         return total,logp_marg_1,logp_marg_2,logDensity,logDetTerm,logCopulaTerm
