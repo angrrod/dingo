@@ -212,7 +212,7 @@ class GWSamplerMixin(object):
                 else:
                     samples["ra"] = (ra - ra_correction) % (2 * np.pi)
 
-    def _post_process(self, samples: Union[dict, pd.DataFrame], inverse: bool = False):
+    def _post_process(self, samples: Union[dict, pd.DataFrame], inverse: bool = False,isJoint:bool = False):
         """
         Post-processing of parameter samples.
         * Add any fixed parameters from the prior.
@@ -227,10 +227,12 @@ class GWSamplerMixin(object):
         inverse : bool, default True
             Whether to apply instead the inverse transformation. This is used prior to
             calculating the log_prob.
+        isJoint :  bool default False
+            indicates if the scenario is a joint overlapping setting or not
         """
         intrinsic_prior = self.metadata["dataset_settings"]["intrinsic_prior"]
         extrinsic_prior = get_extrinsic_prior_dict(
-            self.metadata["train_settings"]["data"]["extrinsic_prior"]
+            self.metadata["train_settings"]["data"]["extrinsic_prior"], joint = isJoint
         )
         prior = build_prior_with_defaults({**intrinsic_prior, **extrinsic_prior})
 

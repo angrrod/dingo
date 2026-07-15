@@ -126,9 +126,6 @@ class BBHExtrinsicPriorDict(BBHPriorDict):
 
             geocent_time_B = geocent_time_A - delta_t_AB
 
-        or, if time_reference == "A_plus_delta":
-
-            geocent_time_B = geocent_time_A + delta_t_AB
         """
 
         if not self.reconstruct_geocent_time_B:
@@ -149,15 +146,11 @@ class BBHExtrinsicPriorDict(BBHPriorDict):
                 "Cannot reconstruct geocent_time_B because geocent_time_A "
                 "is missing from the sampled joint prior."
             )
-
+            
+        #extend to allow different definiton
         if self.time_reference == "A_minus_delta":
             sample["geocent_time_B"] = (
                 sample["geocent_time_A"] - sample["delta_t_AB"]
-            )
-
-        elif self.time_reference == "A_plus_delta":
-            sample["geocent_time_B"] = (
-                sample["geocent_time_A"] + sample["delta_t_AB"]
             )
 
         else:

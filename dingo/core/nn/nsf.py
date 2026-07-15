@@ -242,7 +242,7 @@ class FlowWrapper(nn.Module):
         else:
             # if there is no context, omit the context argument
             return self.log_prob(y)
-
+            
 
 def create_nsf_model(
     input_dim: int,

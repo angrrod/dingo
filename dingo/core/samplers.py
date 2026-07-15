@@ -181,6 +181,7 @@ class Sampler(object):
         self,
         num_samples: int,
         batch_size: Optional[int] = None,
+        isJoint: bool = False,
     ):
         """
         Generates samples and stores them in self.samples. Conditions the model on
@@ -202,6 +203,8 @@ class Sampler(object):
             Number of samples requested.
         batch_size : int, optional
             Batch size for sampler.
+        isJoint :  bool
+            indicates if the scenario is a joint overlapping setting or not
         """
         self.samples = None
 
@@ -227,8 +230,12 @@ class Sampler(object):
 
         # Apply any post-sampling transformation to sampled parameters (e.g.,
         # correction for t_ref) and represent as DataFrame.
-        self._post_process(samples)
-        self.samples = pd.DataFrame(samples)
+        self._post_process(samples,isJoint = isJoint)
+        samples_squashed = {
+            k: v.squeeze(axis=1) if hasattr(v, "shape") and v.ndim == 2 and v.shape[1] == 1 else v
+            for k, v in samples.items()
+        }
+        self.samples = pd.DataFrame(samples_squashed)
         print(f"Done. This took {time.time() - t0:.1f} s.")
         sys.stdout.flush()
 
