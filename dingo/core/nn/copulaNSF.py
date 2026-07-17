@@ -38,7 +38,7 @@ class CopulaNSFFlowWrapper(nn.Module):
             f"{len(posterior_kwargs['flows'])} nbr of flows and {len(self.block_dims)} block dimensions."
         )
         
-        self.flows = nn.ModuleList()   #module list to register parameters
+        flows = nn.ModuleList()   #module list to register parameters
         for i, (flow_name, flow_args) in enumerate(posterior_kwargs["flows"].items()):
             flow = create_nsf_wrapped(
                 input_dim=self.block_dims[i],
@@ -46,12 +46,12 @@ class CopulaNSFFlowWrapper(nn.Module):
                 **flow_args,
             )
 
-            self.flows.append(flow)
+            flows.append(flow)
             
         
         self.copulaNet = CopulaParamNet(self.context_dim,self.D,**self.CopulaKwargs)
 
-        self.vector_copula = AmortizedVectorCopulaFlow(self.flows,self.copulaNet,marginal_backend = 'dingo')
+        self.vector_copula = AmortizedVectorCopulaFlow(flows,self.copulaNet,marginal_backend = 'dingo')
     
     def log_prob(self, y, *x):
         if len(x) > 0:
