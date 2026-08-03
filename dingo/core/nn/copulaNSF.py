@@ -7,7 +7,7 @@ import math
 from dingo.core.nn.enets import DenseResidualNet
 from dingo.core.utils import torchutils
 import copy
-from vector_copula_vi import AmortizedVectorCopulaFlow
+from vector_copula_vi import AmortizedVectorCopulaFlow,DingoVectorCopulaFlow
 
 class CopulaNSFFlowWrapper(nn.Module):
     """
@@ -17,7 +17,12 @@ class CopulaNSFFlowWrapper(nn.Module):
     def __init__(self, posterior_kwargs, embedding_kwargs, initial_weights=None):
         super().__init__()
         
-        self.context_dim  = posterior_kwargs["context_dim"]
+        self.conditional = posterior_kwargs.get("conditional", True)
+        if "context_dim" not in posterior_kwargs:
+            self.context_dim = None
+        else:
+            self.context_dim  = posterior_kwargs["context_dim"]
+            
         self.block_dims   = posterior_kwargs.get("block_dims", [2, 2])
         self.D            = sum(self.block_dims)
 
@@ -25,57 +30,106 @@ class CopulaNSFFlowWrapper(nn.Module):
         self.CopulaKwargs = posterior_kwargs["CopulaKwargs"]
         
         embedding_kwargs  = copy.deepcopy(embedding_kwargs)
-
-        if initial_weights is not None:
-            embedding_kwargs["V_rb_list"] = initial_weights["V_rb_list"]
-        elif "V_rb_list" not in embedding_kwargs:
-            embedding_kwargs["V_rb_list"] = None
+        if not self.conditional:
+            self.embedding_net = None
+        else:
+            if initial_weights is not None:
+                embedding_kwargs["V_rb_list"] = initial_weights["V_rb_list"]
+            elif "V_rb_list" not in embedding_kwargs:
+                embedding_kwargs["V_rb_list"] = None
             
-        self.embedding_net = create_enet_with_projection_layer_and_dense_resnet(**embedding_kwargs)
-        
+            self.embedding_net = create_enet_with_projection_layer_and_dense_resnet(**embedding_kwargs)
         assert len(posterior_kwargs["flows"]) == len(self.block_dims), (
             f"Expected one flow per block dimension, but got "
             f"{len(posterior_kwargs['flows'])} nbr of flows and {len(self.block_dims)} block dimensions."
         )
         
-        flows = nn.ModuleList()   #module list to register parameters
+        self.flows = nn.ModuleList()   #module list to register parameters
         for i, (flow_name, flow_args) in enumerate(posterior_kwargs["flows"].items()):
             flow = create_nsf_wrapped(
                 input_dim=self.block_dims[i],
                 context_dim=self.context_dim,
                 **flow_args,
+                
             )
 
-            flows.append(flow)
-            
+            self.flows.append(flow)
         
-        self.copulaNet = CopulaParamNet(self.context_dim,self.D,**self.CopulaKwargs)
+        if self.conditional:
+            self.copulaNet = CopulaParamNet(
+                self.context_dim,
+                self.D,
+                **self.CopulaKwargs,
+            )
 
-        self.vector_copula = AmortizedVectorCopulaFlow(flows,self.copulaNet,marginal_backend = 'dingo')
-    
+            self.vector_copula = AmortizedVectorCopulaFlow(
+                self.flows,
+                self.copulaNet,
+                marginal_backend="dingo",
+            )
+
+        else:
+            self.copulaNet = None
+            self.vector_copula = None
+            P = self.CopulaKwargs["P"]
+
+            if P >= self.D:
+                raise ValueError(
+                    f"Copula rank P={P} must be smaller than D={self.D}."
+                )
+
+            self.B = nn.Parameter(
+                0.01 * torch.randn(1, self.D, P)
+            )
+
+            self.z = nn.Parameter(
+                torch.zeros(1)
+            )
+    def distribution(self, context=None):
+        if self.conditional:
+            if context is None:
+                raise ValueError(
+                    "Conditional copula requires context."
+                )
+
+            # This calls CopulaParamNet(context) internally.
+            return self.vector_copula#.distribution(context)
+
+        if context is not None:
+            raise ValueError(
+                "Unconditional copula must not receive context."
+            )
+
+        # Non-amortized path: B and z are direct global parameters.
+        return DingoVectorCopulaFlow(
+            flows=self.flows,
+            B=self.B,
+            z=self.z,
+            context=None,
+        )
     def log_prob(self, y, *x):
         if len(x) > 0:
             if self.embedding_net is not None:
                 x = self.embedding_net(*x)
-            return self.vector_copula.log_prob(y, x)
+            return self.distribution().log_prob(y, x)
         else:
-            return self.vector_copula.log_prob(y)
+            return self.distribution().log_prob(y)
     
     def sample(self, *x, num_samples=1):
         if len(x) > 0:
             if self.embedding_net is not None:
                 x = self.embedding_net(*x)
-            return self.vector_copula.sample(sample_shape=num_samples, context = x)
+            return self.distribution().sample(sample_shape=num_samples, context = x)
         else:
-            return self.vector_copula.sample(sample_shape = num_samples)
+            return self.distribution().sample(sample_shape = num_samples)
     
     def sample_and_log_prob(self, *x, num_samples=1):
         if len(x) > 0:
             if self.embedding_net is not None:
                 x = self.embedding_net(*x)
-            return self.vector_copula.sample_and_log_prob(context = x, N=num_samples)
+            return self.distribution().sample_and_log_prob(context = x, N=num_samples)
         else:
-            return self.vector_copula.sample_and_log_prob(N=num_samples)
+            return self.distribution().sample_and_log_prob(N=num_samples)
     
     def forward(self, y, *x):
         if len(x) > 0:

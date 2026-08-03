@@ -208,7 +208,9 @@ class FlowWrapper(nn.Module):
 
     def log_prob(self, y, *x):
         x = x[0]
-        if len(x) > 0:
+        if x is None:
+            return self.flow.log_prob(y)
+        elif len(x) > 0:
             if self.embedding_net is not None:
                 x = self.embedding_net(*x)
             return self.flow.log_prob(y, x)

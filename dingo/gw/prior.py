@@ -13,6 +13,7 @@ import warnings
 from bilby.core.prior import PriorDict
 # Silence INFO and WARNING messages from bilby
 import logging
+from bilby.gw.conversion import generate_mass_parameters
 
 logging.getLogger("bilby").setLevel("ERROR")
 
@@ -305,6 +306,17 @@ def build_prior_with_defaults(prior_settings: Dict[str, str]):
     for k, v in prior_settings.items():
         if v == "default":
             full_prior_settings[k] = default_intrinsic_dict[k]
+            
+    # for overlapping signals context
+    is_joint_prior = (
+        any(key.endswith("_A") for key in full_prior_settings)
+        and any(key.endswith("_B") for key in full_prior_settings)
+    )
+    if is_joint_prior:
+        return BBHPriorDict(
+            full_prior_settings,
+            conversion_function=joint_bbh_prior_conversion,
+        )
 
     return BBHPriorDict(full_prior_settings)
 
@@ -338,3 +350,37 @@ def split_off_extrinsic_parameters(theta):
     theta_intrinsic["geocent_time"] = 0
     theta_intrinsic["luminosity_distance"] = 100
     return theta_intrinsic, theta_extrinsic
+
+def joint_bbh_prior_conversion(sample):
+    """
+    Generate derived mass parameters separately for waveform A and B.
+
+    This conversion is used by Bilby when evaluating Constraint priors.
+    """
+    converted = dict(sample)
+
+    for suffix in ("_A", "_B"):
+        local_sample = {
+            key.removesuffix(suffix): value
+            for key, value in sample.items()
+            if key.endswith(suffix)
+        }
+
+        mass_keys = {
+            "mass_1",
+            "mass_2",
+            "chirp_mass",
+            "mass_ratio",
+            "total_mass",
+            "symmetric_mass_ratio",
+        }
+
+        if len(mass_keys.intersection(local_sample)) < 2:
+            continue
+
+        local_sample = generate_mass_parameters(local_sample)
+
+        for key, value in local_sample.items():
+            converted[f"{key}{suffix}"] = value
+
+    return converted
