@@ -267,6 +267,27 @@ def initialize_stage(
     # Rebuild transforms based on possibly different noise.
     set_train_transforms(wfd, train_settings["data"], stage["asd_dataset_path"])
 
+    ### Optional user-defined diagnostic hook. ###
+    stage_debug_hook = getattr(
+        pm,
+        "stage_debug_hook",
+        None,
+    )
+
+    print("\n=== DINGO STAGE HOOK CHECK ===")
+    print("pm id:", id(pm))
+    print("hook found:", stage_debug_hook)
+    print("callable:", callable(stage_debug_hook))
+
+    if callable(stage_debug_hook):
+        print("Calling custom stage hook...")
+        stage_debug_hook(
+            wfd=wfd,
+            stage=stage,
+        )
+        print("Custom stage hook finished.")
+    ######
+
     # Allows for changes in batch size between stages.
     train_loader, test_loader = build_train_and_test_loaders(
         wfd,
@@ -275,6 +296,8 @@ def initialize_stage(
         num_workers,
     )
 
+
+    
     if not resume:
         # New optimizer and scheduler. If we are resuming, these should have been
         # loaded from the checkpoint.

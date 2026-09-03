@@ -448,6 +448,65 @@ class BasePosteriorModel(ABC):
                                 "test_time": test_time,
                             }
                         )
+                        print("\n=== EPOCH HOOK CHECK ===")
+                        print("Base model file:", __file__)
+                        print("model id:", id(self))
+                        print(
+                            "has hook:",
+                            hasattr(self, "epoch_debug_hook"),
+                        )
+
+                        epoch_debug_hook = getattr(
+                            self,
+                            "epoch_debug_hook",
+                            None,
+                        )
+
+                        print("hook found:", epoch_debug_hook)
+                        print(
+                            "callable:",
+                            callable(epoch_debug_hook),
+                        )
+                        epoch_debug_hook = getattr(
+                            self,
+                            "epoch_debug_hook",
+                            None,
+                        )
+                        
+                        print("hook found:", epoch_debug_hook)
+                        print("callable:", callable(epoch_debug_hook))
+
+
+                        extra_metrics = {}
+                        
+                        if callable(epoch_debug_hook):
+                            print(
+                                f"Calling custom epoch hook "
+                                f"for epoch {self.epoch}..."
+                            )
+
+                            returned_metrics = epoch_debug_hook(
+                                model=self,
+                                epoch=self.epoch,
+                                train_loader=train_loader,
+                                test_loader=test_loader,
+                                train_loss=train_loss,
+                                test_loss=test_loss,
+                                learning_rates=lr,
+                            )
+
+                            if returned_metrics is not None:
+                                extra_metrics.update(
+                                    returned_metrics
+                                )
+
+                            print("Custom epoch metrics:")
+
+                            for key, value in extra_metrics.items():
+                                print(
+                                    f"    {key}: {value}"
+                                )
+                        
                     except ImportError:
                         print("wandb not installed. Skipping logging to wandb.")
 

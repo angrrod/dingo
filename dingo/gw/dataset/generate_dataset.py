@@ -130,7 +130,7 @@ def _extract_signal_suffixes(columns, pattern=r"_[A-Z]$",num_signals = 1):
     default to set of empty suffix str if number of signals  = 1
     """
     if num_signals == 1:
-        return sorted(set(""))
+        return [""]
     suffixes = set()
 
     for col in columns:
@@ -156,8 +156,7 @@ def _split_by_suffix(df: pd.DataFrame, suffixes=None,num_signals = 1) -> dict[st
     """
     
     if num_signals == 1:
-        return {df}
-    
+        return {"": df}    
     if suffixes is None:
         suffixes = _extract_signal_suffixes(df.columns)
     
@@ -301,6 +300,8 @@ def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1) ->
                     waveform_generator,
                     prior,
                     num_processes=num_processes,
+                    num_signals=num_signals,
+
                 )
                 parameters, polarizations = call_func_strict_output_dim(
                     func, n_train + n_test
