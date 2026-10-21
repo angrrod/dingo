@@ -157,7 +157,7 @@ class BBHExtrinsicPriorDict(BBHPriorDict):
         else:
             raise ValueError(
                 f"Unknown time_reference={self.time_reference!r}. "
-                "Use 'A_minus_delta' or 'A_plus_delta'."
+                "Use 'A_minus_delta'"
             )
 
         return sample

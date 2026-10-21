@@ -61,6 +61,7 @@ def generate_parameters_and_polarizations(
     failed_masks = []
     for suffix,parameters_split in splitted_params.items():
         if num_processes > 1:
+            #TODO: generate one pool and not num_processes for separate waveforms.
             with threadpool_limits(limits=1, user_api="blas"):
                 with Pool(processes=num_processes) as pool:
                     polarizations_split  = generate_waveforms_parallel(
@@ -112,7 +113,7 @@ def _recombine_polarizations_with_suffix(
 def _break_symmetry(parameters):
     #break symmetry for overlapping signals
     parameters["geocent_time_B"] = (
-        parameters["geocent_time_A"] + parameters["delta_t_AB"]
+        parameters["geocent_time_A"] - parameters["delta_t_AB"]
     )
     parameters = parameters.drop(columns=["delta_t_AB"]) #remove old column
     return parameters
