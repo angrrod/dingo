@@ -1,4 +1,4 @@
-from multiprocessing import Pool
+from collections import defaultdict
 from typing import Optional
 
 import numpy as np
@@ -6,7 +6,6 @@ import pandas as pd
 from scipy.fft import fft
 from scipy.special import logsumexp
 from bilby.gw.utils import ln_i0
-from threadpoolctl import threadpool_limits
 
 from dingo.core.likelihood import Likelihood
 from dingo.gw.injection import GWSignal
@@ -39,13 +38,11 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
         time_marginalization_kwargs: Optional[dict] = None,
         phase_marginalization_kwargs: Optional[dict] = None,
         calibration_marginalization_kwargs: Optional[dict] = None,
-        phase_grid=None,
         use_base_domain: bool = False,
         frequency_update: Optional[
             dict[str, float | dict[str, float | list[float]]]
         ] = None,
     ):
-        # TODO: Does the phase_grid argument ever get used?
         """
         Parameters
         ----------
@@ -71,9 +68,10 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
             When the domain is a MultibandedFrequencyDomain, whether to use the
             associated base UniformFrequencyDomain for likelihood computations.
         frequency_update: dict
-            Specifies settings for updating the frequency range
-            example: {'minimum_frequency': {'H1': 30., 'L1': 20.},
-                       maximum_frequency: 1024.}
+            The event's frequency range: the ASDs are masked outside it, and the
+            calibration spline nodes are placed across it, per detector. Values
+            are floats or per-detector dicts, e.g.
+            {'minimum_frequency': {'H1': 30., 'L1': 20.}, 'maximum_frequency': 1024.}
         """
         super().__init__(
             wfg_kwargs=wfg_kwargs,
@@ -81,6 +79,7 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
             data_domain=data_domain,
             ifo_list=list(event_data["waveform"].keys()),
             t_ref=t_ref,
+            frequency_update=frequency_update,
         )
 
         if isinstance(data_domain, MultibandedFrequencyDomain) and not use_base_domain:
@@ -152,7 +151,9 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
             ]
         )
         self.whiten = True
-        self.phase_grid = phase_grid
+        # Assigned by phase-grid consumers (synthetic phase) or set internally by
+        # phase marginalization; never a construction input.
+        self.phase_grid = None
 
         # optionally initialize time marginalization
         self.time_marginalization = False
@@ -177,6 +178,12 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
 
         # Initialize calibration marginalization using the setter from GWSignal.
         self.calibration_marginalization_kwargs = calibration_marginalization_kwargs
+
+        # When set, log_likelihood returns (log_likelihood, snr) pairs, where snr
+        # is the matched-filter signal-to-noise ratio of the waveform against the
+        # data (phase-maximized under phase marginalization). Used by the
+        # chirp-mass scan to report trigger quality.
+        self.return_aux_snr = False
 
     def initialize_time_marginalization(self, t_lower, t_upper, n_fft=1):
         """
@@ -314,7 +321,13 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
                 for d_ifo, mu_ifo in zip(d.values(), mu.values())
             ],
         )
-        return self.log_Zn + kappa2 - 1 / 2.0 * rho2opt
+        log_likelihood = self.log_Zn + kappa2 - 1 / 2.0 * rho2opt
+
+        if self.return_aux_snr:
+            snr = kappa2 / rho2opt**0.5
+            return log_likelihood, snr
+
+        return log_likelihood
 
     def log_likelihood_phase_grid(
         self, theta: dict, phases: Optional[np.ndarray] = None
@@ -335,6 +348,8 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
     def _log_likelihood_phase_grid_manual(
         self, theta: dict, phases: Optional[np.ndarray] = None
     ) -> np.ndarray:
+        if self.return_aux_snr:
+            raise NotImplementedError
         if self.phase_marginalization:
             raise ValueError(
                 "Can't compute likelihood on a phase grid for "
@@ -355,7 +370,19 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
         return log_likelihoods
 
     def _log_likelihood_phase_grid_mode_decomposed(self, theta, phases=None):
+        if phases is None:
+            phases = self.phase_grid
+        terms = self.phase_grid_terms(theta)
+        return self.log_likelihood_from_phase_grid_terms(terms, phases, [theta["psi"]])[
+            :, 0
+        ]
+
+    def _check_phase_grid_supported(self):
+        """The phase grid terms describe the plain likelihood: raise for the settings
+        they do not cover."""
         # TODO: Implement for time marginalization
+        if self.return_aux_snr:
+            raise NotImplementedError
         if self.phase_marginalization:
             raise ValueError(
                 "Can't compute likelihood on a phase grid for "
@@ -366,26 +393,198 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
                 "log_likelihood on phase grid not yet implemented."
             )
 
+    def phase_grid_terms_22(self, theta: dict) -> dict:
+        """
+        Compute, from one waveform evaluation at phase = 0, the two inner products
+        from which `log_likelihood_22_from_terms` evaluates the log likelihood at
+        any phase, assuming a phase shift multiplies the waveform by
+        `exp(2i phase)` (`WaveformGenerator.phase_is_global_factor`).
+
+        Parameters
+        ----------
+        theta: dict
+            BBH parameters. The phase is ignored.
+
+        Returns
+        -------
+        dict
+            d_inner_h: complex, (d, h_0); h_inner_h: float, (h_0, h_0).
+        """
+        self._check_phase_grid_supported()
+        mu = self.signal({**theta, "phase": 0.0})["waveform"]
+        d = self.whitened_strains
+        return {
+            "d_inner_h": sum(
+                inner_product_complex(d_ifo, mu_ifo)
+                for d_ifo, mu_ifo in zip(d.values(), mu.values())
+            ),
+            "h_inner_h": sum(inner_product(mu_ifo, mu_ifo) for mu_ifo in mu.values()),
+        }
+
+    def log_likelihood_22_from_terms(
+        self, terms: dict, phases: np.ndarray
+    ) -> np.ndarray:
+        """
+        Evaluate the log likelihood at the given phases from the output of
+        `phase_grid_terms_22`, without a waveform evaluation:
+
+            log L(ph) = log_Zn + Re[(d, h_0) exp(2i ph)] - (h_0, h_0) / 2
+
+        Parameters
+        ----------
+        terms: dict
+            As returned by `phase_grid_terms_22`, optionally stacked along a
+            leading sample axis.
+        phases: np.ndarray
+            (G,) phases, shared by all samples, or (N, G) phases per sample.
+
+        Returns
+        -------
+        np.ndarray
+            (G,) log likelihoods for unstacked terms, else (N, G).
+        """
+        d_inner_h = np.asarray(terms["d_inner_h"])[..., None]
+        h_inner_h = np.asarray(terms["h_inner_h"])[..., None]
+        return (
+            self.log_Zn
+            + (d_inner_h * np.exp(2j * np.asarray(phases))).real
+            - h_inner_h / 2
+        )
+
+    def phase_psi_terms_22(self, theta: dict) -> dict:
+        """
+        Like `phase_grid_terms_22`, but for every polarization angle at once. Since
+        psi enters only through the antenna patterns, the signal at phase = 0 is
+
+            h(psi) = cos(2 psi) h^0 + sin(2 psi) h^1,
+
+        with h^0, h^1 the projections at psi = 0 and psi = pi / 4 of one waveform
+        evaluation. `terms_22_at_psi` combines the returned inner products into those
+        of `phase_grid_terms_22` at any psi.
+
+        Parameters
+        ----------
+        theta: dict
+            BBH parameters. The phase and psi are ignored.
+
+        Returns
+        -------
+        dict
+            d_inner_h: (2,) complex, (d, h^b); h_inner_h: (2, 2) real, Re (h^b, h^c).
+        """
+        self._check_phase_grid_supported()
+        # (n_freq, 2) per detector, frequency first as the inner products sum over it.
+        mu = {
+            ifo: h.T
+            for ifo, h in self.signal_psis(
+                {**theta, "phase": 0.0}, (0.0, np.pi / 4)
+            ).items()
+        }
+        d = self.whitened_strains
+        return {
+            "d_inner_h": sum(
+                inner_product_complex(d[ifo][:, None], mu[ifo]) for ifo in mu
+            ),
+            "h_inner_h": sum(
+                inner_product(mu[ifo][:, :, None], mu[ifo][:, None, :]) for ifo in mu
+            ),
+        }
+
+    def terms_22_at_psi(self, terms: dict, psis: np.ndarray) -> dict:
+        """
+        Combine the output of `phase_psi_terms_22` into that of `phase_grid_terms_22`
+        at the given polarization angles, ready for `log_likelihood_22_from_terms`:
+        with weights w = (cos 2 psi, sin 2 psi), (d, h(psi)) = w . d_inner_h and
+        (h(psi), h(psi)) = w . h_inner_h . w.
+
+        Parameters
+        ----------
+        terms: dict
+            As returned by `phase_psi_terms_22`, optionally stacked along a leading
+            sample axis N.
+        psis: np.ndarray
+            (H,) angles, shared by all samples, or (N, H) angles per sample.
+
+        Returns
+        -------
+        dict
+            d_inner_h, h_inner_h of shape (H,), or (N, H) with a sample axis.
+        """
+        psis = np.asarray(psis)
+        w = np.stack([np.cos(2 * psis), np.sin(2 * psis)], axis=-1)
+        return {
+            "d_inner_h": np.einsum("...b,...hb->...h", terms["d_inner_h"], w),
+            "h_inner_h": np.einsum("...bc,...hb,...hc->...h", terms["h_inner_h"], w, w),
+        }
+
+    def phase_grid_terms(self, theta: dict) -> dict:
+        """
+        Compute, from one waveform evaluation at phase = 0, the inner products from
+        which `log_likelihood_from_phase_grid_terms` evaluates the log likelihood at
+        any phase and psi. Each m-component mu_m of the signal transforms as
+        exp(-i m phase). This requires the waveform generator's
+        `spin_conversion_phase = 0`, and no phase or time marginalization.
+
+        The m-components are projected onto the detectors at the basis angles
+        psi = 0 and psi = pi / 4 (b = 0, 1). Since psi enters only through the
+        antenna patterns,
+
+            mu(psi) = cos(2 psi) mu(0) + sin(2 psi) mu(pi / 4).
+
+        Parameters
+        ----------
+        theta: dict
+            BBH parameters. The phase and psi are ignored.
+
+        Returns
+        -------
+        dict
+            With mu^b_m the whitened m-component at basis angle b, and
+            (x, y) = sum(x.conj() * y) over frequency bins and detectors:
+            m_vals: (M,) the values of m;
+            kappa2_modes: (2, M) complex, (d, mu^b_m);
+            rho2opt_const: (2, 2) real, sum_m Re (mu^b_m, mu^c_m);
+            deltas: (P,) the distinct differences n - m > 0;
+            rho2opt_crossterms: (2, 2, P) complex, the sum over m < n with
+                n - m = delta of (mu^b_m, mu^c_n) + (mu^c_m, mu^b_n).
+        """
+        self._check_phase_grid_supported()
         if self.waveform_generator.spin_conversion_phase != 0:
+            # For a model whose phase shift is a global factor there is no reason to
+            # fix the convention: say so, since this is the recommended BNS setup.
+            hint = (
+                f" For {self.waveform_generator.approximant_str} the (2, 2) path "
+                f"(approximation_22_mode=True) is exact in this convention, at one "
+                f"waveform evaluation per sample instead of 2 ell_max + 1."
+                if self.waveform_generator.phase_is_global_factor
+                else ""
+            )
             raise ValueError(
                 f"The log likelihood on a phase grid assumes "
                 f"WaveformGenerator.spin_conversion_phase = 0, "
-                f"got {self.waveform_generator.spin_conversion_phase}."
+                f"got {self.waveform_generator.spin_conversion_phase}.{hint}"
             )
 
         d = self.whitened_strains
-        if phases is None:
-            phases = self.phase_grid
 
         # Step 1: Compute signal for phase = 0, separated into the m-contributions from
-        # the individual modes.
-        pol_m = self.signal_m({**theta, "phase": 0})
-        pol_m = {k: pol["waveform"] for k, pol in pol_m.items()}
+        # the individual modes, projected at each basis polarization angle.
+        # mu[m][ifo][b] is the whitened strain of mode m at the b-th angle.
+        mu = self.signal_m({**theta, "phase": 0}, (0.0, np.pi / 4))
 
         # Step 2: Precompute complex inner products (mu, mu) and (d, mu) for the
-        # individual modes m.
+        # individual modes m (and basis pairs b, c).
         min_idx = self.data_domain.min_idx
-        m_vals = sorted(pol_m.keys())
+        m_vals = sorted(mu.keys())
+
+        def overlap(x, y):
+            # Complex inner products sum(x.conj() * y) over frequency bins and
+            # detectors; x, y are {ifo: strain} with optional leading basis axes,
+            # so two (2, F) strains give the (2, 2) matrix over basis pairs [b, c].
+            return sum(
+                np.inner(x[ifo][..., min_idx:].conj(), y[ifo][..., min_idx:])
+                for ifo in x
+            )
 
         # rho2opt is defined as the inner product of the waveform mu with itself.
         # Since we work with whitened data, the inner product simply reads
@@ -398,26 +597,23 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
         #
         #   (mu^_m, mu^_n) = [(mu_m.conj() * mu_n) * exp(-i * (n - m) * phi)].real.
         #
-        # Below we precompute the cross terms sum(mu_m.conj() * mu_n) and the constant
+        # With mu = sum_b w_b mu^b (real weights w, e.g. cos 2 psi and sin 2 psi), the
+        # same expansion holds per basis pair (b, c), weighted by w_b w_c. Below we
+        # precompute the cross terms sum(mu^b_m.conj() * mu^c_n) and the constant
         # contribution for m = n.
-        rho2opt_const = 0
-        rho2opt_crossterms = {}
+        rho2opt_const = sum(overlap(mu[m], mu[m]).real for m in m_vals)
+        # The cross terms only depend on the mode difference delta = n - m, so we
+        # accumulate them by delta. For m in -4..4 this collapses 36 pairs onto 8
+        # distinct deltas, i.e. a 4.5x smaller exponential matrix in the evaluation.
+        crossterms_by_delta = defaultdict(lambda: np.zeros((2, 2), dtype=complex))
         for idx, m in enumerate(m_vals):
-            mu_m = pol_m[m]
-            # contribution to rho2opt_const
-            rho2opt_const += sum(
-                [inner_product(mu_ifo, mu_ifo, min_idx) for mu_ifo in mu_m.values()]
-            )
-            # cross terms
             for n in m_vals[idx + 1 :]:
-                mu_n = pol_m[n]
-                # factor 2, since (m, n) and (n, m) cross terms contribute symmetrically
-                rho2opt_crossterms[(m, n)] = 2 * sum(
-                    [
-                        inner_product_complex(mu_m_ifo, mu_n_ifo, min_idx)
-                        for mu_m_ifo, mu_n_ifo in zip(mu_m.values(), mu_n.values())
-                    ]
-                )
+                pair = overlap(mu[m], mu[n])
+                # (m, n) and (n, m) contribute symmetrically: entry [b, c] collects
+                # (mu^b_m, mu^c_n) + (mu^c_m, mu^b_n).
+                crossterms_by_delta[n - m] += pair + pair.T
+        deltas = sorted(crossterms_by_delta)
+
         # kappa2 is given by
         #
         #   (d, mu) = sum(d.conj() * mu).real.
@@ -427,53 +623,72 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
         #
         #   (d, mu^_m) = [(d.conj() * mu_m) * exp(-i * m * phi)].real.
         #
-        # Below we precompute (d.conj() * mu_m) for the different modes m.
-        kappa2_modes = {}
-        for m in m_vals:
-            mu_m = pol_m[m]
-            kappa2_modes[m] = sum(
-                [
-                    inner_product_complex(d_ifo, mu_ifo, min_idx)
-                    for d_ifo, mu_ifo in zip(d.values(), mu_m.values())
-                ]
-            )
+        # Below we precompute (d.conj() * mu^b_m) for the different modes m.
+        kappa2_modes = np.array([overlap(d, mu[m]) for m in m_vals]).T
 
-        log_likelihoods = np.ones(len(phases))
-        kappa2_all = []
-        rho2opt_all = []
-        for idx, phase in enumerate(phases):
-            # get rho2opt
-            rho2opt = rho2opt_const
-            for (m, n), c in rho2opt_crossterms.items():
-                rho2opt += (c * np.exp(-1j * (n - m) * phase)).real
-            # get kappa2
-            kappa2 = 0
-            for m in m_vals:
-                kappa2 += (kappa2_modes[m] * np.exp(-1j * m * phase)).real
-            rho2opt_all.append(rho2opt)
-            kappa2_all.append(kappa2)
+        return {
+            "m_vals": np.array(m_vals),
+            "kappa2_modes": kappa2_modes,
+            "rho2opt_const": rho2opt_const,
+            "deltas": np.array(deltas),
+            "rho2opt_crossterms": np.moveaxis(
+                np.array([crossterms_by_delta[delta] for delta in deltas]), 0, -1
+            ),
+        }
 
-            log_likelihoods[idx] = self.log_Zn + kappa2 - 1 / 2.0 * rho2opt
+    def log_likelihood_from_phase_grid_terms(
+        self, terms: dict, phases: np.ndarray, psis: np.ndarray
+    ) -> np.ndarray:
+        """
+        Evaluate the log likelihood on a grid of phases and polarization angles from
+        the output of `phase_grid_terms`, without a waveform evaluation. With basis
+        weights w = [cos 2 psi, sin 2 psi],
 
-            # # comment out for cross check:
-            # mu = sum_contributions_m(pol_m, phase_shift=phase)
-            # rho2opt_ref = sum([inner_product(mu_ifo, mu_ifo) for mu_ifo in mu.values()])
-            # kappa2_ref = sum(
-            #     [
-            #         inner_product(d_ifo, mu_ifo)
-            #         for d_ifo, mu_ifo in zip(d.values(), mu.values())
-            #     ]
-            # )
-            # assert rho2opt - rho2opt_ref < 1e-10
-            # assert kappa2 - kappa2_ref < 1e-10
+            kappa2  = sum_b w_b Re sum_m kappa2_modes[b, m] exp(-i m phase)
+            rho2opt = sum_{b, c} w_b w_c (rho2opt_const[b, c]
+                + Re sum_delta rho2opt_crossterms[b, c, delta] exp(-i delta phase))
+            log L   = log_Zn + kappa2 - rho2opt / 2
 
-        # # Test that this works:
-        # idx = len(phases) // 3
-        # phase = phases[idx]
-        # log_likelihood_ref = self.log_likelihood({**theta, "phase": phase})
-        # print(log_likelihoods[idx] - log_likelihood_ref)
+        The terms of several samples can be evaluated at once by stacking
+        `kappa2_modes`, `rho2opt_crossterms` and `rho2opt_const` along a leading
+        batch dimension N (the mode orders `m_vals` and `deltas` are shared).
 
-        return log_likelihoods
+        Parameters
+        ----------
+        terms: dict
+            As returned by `phase_grid_terms`, optionally stacked.
+        phases: np.ndarray
+            (G,) phases, shared by all samples, or (N, G) phases per sample.
+        psis: np.ndarray
+            (H,) polarization angles, shared, or (N, H) per sample.
+
+        Returns
+        -------
+        np.ndarray
+            Log likelihoods over all (phase, psi) pairs, of shape (G, H), or
+            (N, G, H) with a sample axis in the terms or the angles.
+        """
+        phases = np.asarray(phases)
+        psis = np.asarray(psis)
+        # Basis weights of shape (..., H, K) with K = 2.
+        w = np.stack([np.cos(2 * psis), np.sin(2 * psis)], axis=-1)
+        # Phasors exp(-i * order * ph) of shape (..., orders, G), contracted with the
+        # coefficients of shape (..., K, orders) over the orders, leaving the basis
+        # axes: (..., K, G) and (..., K, K, G).
+        phasor_m = np.exp(-1j * terms["m_vals"][:, None] * phases[..., None, :])
+        phasor_delta = np.exp(-1j * terms["deltas"][:, None] * phases[..., None, :])
+        kappa2_b = (terms["kappa2_modes"] @ phasor_m).real
+        crossterms = terms["rho2opt_crossterms"]
+        rho2opt_bc = np.asarray(terms["rho2opt_const"])[..., None] + (
+            crossterms.reshape(*crossterms.shape[:-3], 4, -1) @ phasor_delta
+        ).real.reshape(*kappa2_b.shape[:-2], 2, 2, -1)
+        # Contract the basis axes with the weights.
+        kappa2 = np.einsum("...bg,...hb->...gh", kappa2_b, w, optimize=True)
+        rho2opt = np.einsum(
+            "...bcg,...hb,...hc->...gh", rho2opt_bc, w, w, optimize=True
+        )
+        log_likelihood = self.log_Zn + kappa2 - 0.5 * rho2opt
+        return log_likelihood
 
     def _log_likelihood_phase_marginalized(self, theta):
         """
@@ -512,7 +727,16 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
                     for d_ifo, mu_ifo in zip(d.values(), mu.values())
                 ]
             )
-            return self.log_Zn + ln_i0(np.abs(kappa2C)) - 1 / 2.0 * rho2opt
+            log_likelihood = self.log_Zn + ln_i0(np.abs(kappa2C)) - 1 / 2.0 * rho2opt
+
+            if self.return_aux_snr:
+                # Phase-maximized matched-filter SNR: |kappa2C| / sqrt(rho2opt).
+                # (ln_i0(|kappa2C|) is the phase-marginalized likelihood term
+                # above, not a matched-filter statistic.)
+                snr = np.abs(kappa2C) / rho2opt**0.5
+                return log_likelihood, snr
+
+            return log_likelihood
 
         else:
             log_likelihoods_phase_grid = self.log_likelihood_phase_grid(theta)
@@ -596,7 +820,16 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
         alpha = np.max(exponent)
         kappa2 = alpha + np.log(np.sum(np.exp(exponent - alpha)))
 
-        return self.log_Zn + kappa2 - 1 / 2.0 * rho2opt
+        log_likelihood = self.log_Zn + kappa2 - 1 / 2.0 * rho2opt
+
+        if self.return_aux_snr:
+            # Here kappa2 is the time-marginalized term, not a matched-filter
+            # statistic.
+            raise NotImplementedError(
+                "return_aux_snr is not implemented for time marginalization."
+            )
+
+        return log_likelihood
 
     def _log_likelihood_calibration_marginalized(self, theta):
         """
@@ -611,6 +844,8 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
         -------
         log_likelihood: float
         """
+        if self.return_aux_snr:
+            raise NotImplementedError
 
         # Step 1: Compute whitened GW strain mu(theta) for parameters theta.
         mu = self.signal(theta)["waveform"]
@@ -639,40 +874,6 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
         # Return the average over calibration envelopes
         return logsumexp(likelihoods) - np.log(len(likelihoods))
 
-    def d_inner_h_complex_multi(
-        self, theta: pd.DataFrame, num_processes: int = 1
-    ) -> np.ndarray:
-        """
-        Calculate the complex inner product (d | h(theta)) between the stored data d
-        and a simulated waveform with given parameters theta. Works with multiprocessing.
-
-        Parameters
-        ----------
-        theta : pd.DataFrame
-            Parameters at which to evaluate h.
-        num_processes : int
-            Number of parallel processes to use.
-
-        Returns
-        -------
-        complex : Inner product
-        """
-        with threadpool_limits(limits=1, user_api="blas"):
-            # Generator object for theta rows. For idx this yields row idx of
-            # theta dataframe, converted to dict, ready to be passed to
-            # self.log_likelihood.
-            theta_generator = (d[1].to_dict() for d in theta.iterrows())
-
-            if num_processes > 1:
-                with Pool(processes=num_processes) as pool:
-                    d_inner_h_complex = pool.map(
-                        self.d_inner_h_complex, theta_generator
-                    )
-            else:
-                d_inner_h_complex = list(map(self.d_inner_h_complex, theta_generator))
-
-        return np.array(d_inner_h_complex)
-
     def d_inner_h_complex(self, theta):
         """
         Calculate the complex inner product (d | h(theta)) between the stored data d
@@ -685,19 +886,14 @@ class StationaryGaussianGWLikelihood(GWSignal, Likelihood):
 
         Returns
         -------
-        complex : Inner product
+        complex : Inner product (d|h)
         """
         # TODO: Implement for time marginalization.
-        return self._d_inner_h_complex(theta)
-
-    def _d_inner_h_complex(self, theta):
         mu = self.signal(theta)["waveform"]
         d = self.whitened_strains
         return sum(
-            [
-                inner_product_complex(d_ifo, mu_ifo)
-                for d_ifo, mu_ifo in zip(d.values(), mu.values())
-            ]
+            inner_product_complex(d_ifo, mu_ifo)
+            for d_ifo, mu_ifo in zip(d.values(), mu.values())
         )
 
 

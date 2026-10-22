@@ -95,8 +95,9 @@ def td_modes_to_fd_modes(hlm_td, domain):
     delta_t = 0.5 / domain.f_max
     f_nyquist = domain.f_max  # use f_max as f_nyquist
     chirplen = int(2 * f_nyquist / delta_f)
-    # sample frequencies, -f_max,...,-f_min,...0,...,f_min,...,f_max
-    freqs = np.concatenate((-domain()[::-1], domain()[1:]), axis=0)
+    # sample frequencies, -f_max,...,-f_min,...0,...,f_min,...,f_max. In float64, since
+    # the time-shift phase below would otherwise be computed in single precision.
+    freqs = np.concatenate((-domain()[::-1], domain()[1:]), axis=0).astype(float)
     # For even chirplength, we get chirplen + 1 output frequencies. However, the f_max
     # and -f_max bins are redundant, so we have chirplen unique bins.
     assert len(freqs) == chirplen + 1
@@ -299,3 +300,46 @@ def taper_td_modes_for_SEOBRNRv5_extra_time(
 
     # return timeseries
     return h_return
+
+
+def recover_pol_m_from_multi_phase(hpc_fd_list, phi_c_values, m_max):
+    """
+    Recover m-decomposed FD polarizations via DFT over phi_c evaluations.
+
+    Since h_+(f; phi_c) = sum_m h_{+,m}(f) exp(-i*m*phi_c), we recover:
+        h_{+,m}(f) = (1/N) sum_k h_+(f; phi_c_k) exp(+i*m*phi_c_k)
+
+    Parameters
+    ----------
+    hpc_fd_list: list of dict
+        List of {"h_plus": array, "h_cross": array} for each phi_c evaluation.
+    phi_c_values: np.ndarray
+        Phase offsets, relative to the reference phase of the waveform, at which
+        the polarizations were evaluated.
+    m_max: int
+        Maximum |m| value (= l_max). len(phi_c_values) must be 2*m_max+1.
+
+    Returns
+    -------
+    pol_m: dict
+        {m: {"h_plus": hp_m, "h_cross": hc_m}} for m in [-m_max, ..., m_max].
+        Each pol_m[m] transforms as exp(-i*m*phase) under phase shifts.
+    """
+    N = len(phi_c_values)
+    m_indices = np.arange(-m_max, m_max + 1)
+
+    # Phase matrix: shape (2*m_max+1, N) — single batch of exp() calls
+    phase_matrix = np.exp(1j * np.outer(m_indices, phi_c_values)) / N
+
+    # Stack all polarizations into arrays: shape (N, n_freq)
+    hp_stack = np.stack([d["h_plus"] for d in hpc_fd_list])
+    hc_stack = np.stack([d["h_cross"] for d in hpc_fd_list])
+
+    # DFT via matrix multiply: (2*m_max+1, n_freq)
+    hp_m_all = phase_matrix @ hp_stack
+    hc_m_all = phase_matrix @ hc_stack
+
+    pol_m = {}
+    for i, m in enumerate(m_indices):
+        pol_m[int(m)] = {"h_plus": hp_m_all[i], "h_cross": hc_m_all[i]}
+    return pol_m

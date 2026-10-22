@@ -12,7 +12,7 @@ DENSITY_RECOVERY_SETTINGS = {
                         "num_transform_blocks": 4,
                         "activation": "elu",
                         "dropout_probability": 0.1,
-                        "batch_norm": True,
+                        "norm": "BatchNorm",
                         "num_bins": 8,
                         "base_transform_type": "rq-coupling",
                     },
@@ -36,11 +36,22 @@ DENSITY_RECOVERY_SETTINGS = {
     },
 }
 
+# Both recovery defaults leave approximation_22_mode to Result, which takes the
+# (2, 2) path where it is exact (WaveformGenerator.phase_is_global_factor, e.g. BNS
+# networks in Bilby's spin convention) and the exact mode sum otherwise.
 IMPORTANCE_SAMPLING_SETTINGS = {
     "PhaseRecoveryDefault": {
-        "synthetic_phase": {
-            "approximation_22_mode": False,
-            "n_grid": 5001,
+        "synthetic_parameters": {
+            "n_grid_phase": 5001,
+            "uniform_weight": 0.01,
+        },
+    },
+    # For networks that infer neither phase nor psi: both are drawn from the
+    # likelihood.
+    "PhasePsiRecoveryDefault": {
+        "synthetic_parameters": {
+            "n_grid_phase": 512,
+            "n_grid_psi": 128,
             "uniform_weight": 0.01,
         },
     },

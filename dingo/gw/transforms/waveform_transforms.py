@@ -1,5 +1,8 @@
 from typing import Optional
+
+import lal
 import numpy as np
+import torch
 
 from dingo.gw.domains import MultibandedFrequencyDomain, UniformFrequencyDomain
 
@@ -157,14 +160,17 @@ class DecimateWaveformsAndASDS(object):
                     k: self.multibanded_frequency_domain.decimate(v)
                     for k, v in whitened_waveforms.items()
                 }
-                asds_dec = {
-                    k: 1 / self.multibanded_frequency_domain.decimate(1 / v)
-                    for k, v in sample["asds"].items()
-                }
-                # color the whitened waveforms with the effective asd
-                waveform_dec = {
-                    k: v * asds_dec[k] for k, v in whitened_waveforms_dec.items()
-                }
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    asds_dec = {
+                        k: 1 / self.multibanded_frequency_domain.decimate(1 / v)
+                        for k, v in sample["asds"].items()
+                    }
+                    # Prevent NaN in the waveform due to 0 * np.inf, set
+                    # to 0 instead.
+                    waveform_dec = {
+                        k: np.where(np.isinf(asds_dec[k]), 0.0, v * asds_dec[k])
+                        for k, v in whitened_waveforms_dec.items()
+                    }
                 sample["waveform"] = waveform_dec
                 sample["asds"] = asds_dec
 
@@ -555,3 +561,186 @@ def create_mask_based_on_frequency_update(
             frequency_masks[d] = frequency_masks[d] & mask_max
 
     return frequency_masks
+
+
+def factor_fiducial_waveform(
+    data, domain, chirp_mass, mass_ratio=None, order=0, inverse=False
+):
+    """
+    Relative binning / heterodyning. Divides the data by a fiducial waveform defined by
+    the chirp mass and (optionally) mass ratio. Allows for batching.
+
+    At leading order, this factors out the overall chirp by dividing the data by a
+    fiducial waveform of the form::
+
+        exp(-1j * (3/128) * (pi * G * chirp_mass * f / c**3) ** (-5/3));
+
+    see 2001.11412, eq. (7.2). This is the leading order chirp due to the emission of
+    quadrupole radiation.
+
+    At next-to-leading order, this implements 1PN corrections involving the mass ratio.
+
+    We do not include any amplitude in the fiducial waveform, since at inference time
+    this transformation will be applied to noisy data. Multiplying the frequency-domain
+    noise by a complex number of unit norm is allowed because it only changes the
+    phase, not the overall amplitude, which would change the noise PSD.
+
+    Parameters
+    ----------
+    data : Union[dict, torch.Tensor]
+        If a dict, the keys would correspond to different detectors or
+        polarizations. For a Tensor, these would be within different components.
+        This method uses the same fiducial waveform for each detector.
+    domain : Domain
+        Only works for a FrequencyDomain or MultibandedFrequencyDomain at present.
+    chirp_mass : Union[np.array, torch.Tensor, float]
+        Chirp mass parameter(s).
+    mass_ratio : Union[np.array, torch.Tensor, float]
+        Mass ratio parameter(s).
+    order : int
+        Twice the post-Newtonian order for the expansion. Valid orders are 0 and 2.
+    inverse : bool
+        If True, apply the inverse transformation (restore chirp phase).
+
+    Returns
+    -------
+    data: Union[dict, torch.Tensor]
+        Transformed data, of the same form as data.
+    """
+    if order not in (0, 2):
+        raise ValueError(f"Order {order} invalid. Acceptable values are 0 and 2.")
+    if order == 2:
+        if mass_ratio is None:
+            raise ValueError("Mass ratio required for 2nd order heterodyning.")
+        elif (
+            isinstance(chirp_mass, (np.ndarray, torch.Tensor))
+            and chirp_mass.shape != mass_ratio.shape
+        ):
+            raise ValueError(
+                f"Shape of chirp_mass ({chirp_mass.shape}) and mass_ratio "
+                f"({mass_ratio.shape}) don't match"
+            )
+    if type(data) == dict:
+        f = domain.get_sample_frequencies_astype(list(data.values())[0])
+    else:
+        f = domain.get_sample_frequencies_astype(data)
+
+    # numpy or torch, following the chirp mass.
+    if isinstance(chirp_mass, torch.Tensor):
+        xp = torch
+    elif isinstance(chirp_mass, (int, float, np.floating, np.ndarray)):
+        xp = np
+    else:
+        raise TypeError(
+            f"Invalid type {type(chirp_mass)}. "
+            f"Only implemented for floats, arrays and tensors"
+        )
+
+    # The phase is computed in float64 whatever the input dtypes: it reaches 1e4 rad
+    # at 20 Hz for a BNS, where float32 resolves only 1e-3 rad, and 1e5 rad at the
+    # 5 Hz of next-generation detectors, where the float32 rounding would exceed the
+    # mismatch tolerance of loud signals. The data keep their own dtype.
+    mc = xp.asarray(chirp_mass, dtype=xp.float64).reshape(-1)
+    if not xp.isfinite(mc).all():
+        raise ValueError("Got nan or inf elements in chirp_mass.")
+    f64 = xp.asarray(f, dtype=xp.float64)
+    # A uniform domain starts at f = 0; that bin is chopped off or multiplied by 0
+    # later anyway.
+    f_pow = xp.where(f64 == 0, 1.0, f64) ** (-5 / 3)
+
+    # Leading (0PN) phase, (3/128) (pi G Mc f / c^3)^(-5/3). The powers of Mc and f
+    # are taken separately and combined by an outer product, which is much cheaper
+    # than a power of the batch-by-frequency array.
+    G = np.pi * lal.GMSUN_SI / lal.C_SI**3  # pi G / c^3 per solar mass
+    fiducial_phase = (3 / 128) * xp.outer((G * mc) ** (-5 / 3), f_pow)
+
+    # 1PN correction, 1 + (55 eta / 9 + 3715 / 756) (pi G M f / c^3)^(2/3), with the
+    # total mass M = Mc eta^(-3/5).
+    if order == 2:
+        q = xp.asarray(mass_ratio, dtype=xp.float64).reshape(-1)
+        eta = q / (1 + q) ** 2
+        fiducial_phase = fiducial_phase * (
+            1
+            + (55 * eta / 9 + 3715 / 756)[:, None]
+            * xp.outer((G * mc) ** (2 / 3) * eta ** (-2 / 5), f64 ** (2 / 3))
+        )
+
+    if np.ndim(chirp_mass) == 0:
+        fiducial_phase = fiducial_phase.squeeze(0)
+    if inverse:
+        fiducial_phase = -fiducial_phase
+
+    def apply(v):
+        # Keep the dtype of single-precision data (the phase is float64).
+        out = domain.add_phase(v, -fiducial_phase)
+        if isinstance(v, np.ndarray):
+            out = out.astype(v.dtype, copy=False)
+        elif torch.is_complex(v):
+            out = out.to(v.dtype)
+        return out
+
+    if type(data) == dict:
+        return {k: apply(v) for k, v in data.items()}
+    return apply(data)
+
+
+class HeterodynePhase(object):
+    """
+    Transform operator for applying phase heterodyning. See docstring of
+    factor_fiducial_waveform for details.
+    """
+
+    def __init__(
+        self,
+        domain,
+        order: int = 0,
+        inverse: bool = False,
+        fixed_parameters: dict = None,
+    ):
+        """
+        Parameters
+        ----------
+        domain: Domain
+            Domain of the waveform data.
+        order : int
+            Twice the post-Newtonian order for the expansion. Either 0 or 2.
+        inverse : bool
+            Whether to apply the forward or inverse transform. Default: False.
+        fixed_parameters: dict = None
+            If set, extract chirp_mass and mass_ratio parameters from this dict instead
+            from the input sample.
+        """
+        self.domain = domain
+        self.order = order
+        self.inverse = inverse
+        self.fixed_parameters = fixed_parameters
+
+    def __call__(self, input_sample):
+        """
+        Parameters
+        ----------
+        input_sample : dict
+            sample["waveform"]: Dict with values being arrays containing waveforms,
+            or torch Tensor with the waveform.
+            sample["parameters"] contains parameters of the binary system. Required for
+            chirp mass (and mass ratio if self.order == 2).
+
+        Returns
+        -------
+        dict of the same form as the input, but with transformed (heterodyned) waveforms.
+        """
+        sample = input_sample.copy()
+        waveform = sample["waveform"]
+        if self.fixed_parameters:
+            parameters = self.fixed_parameters
+        else:
+            parameters = sample["parameters"]
+        sample["waveform"] = factor_fiducial_waveform(
+            waveform,
+            self.domain,
+            parameters["chirp_mass"],
+            mass_ratio=parameters.get("mass_ratio"),
+            order=self.order,
+            inverse=self.inverse,
+        )
+        return sample

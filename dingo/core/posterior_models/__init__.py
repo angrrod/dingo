@@ -4,3 +4,5 @@ from dingo.core.posterior_models.cflow_base import ContinuousFlowPosteriorModel
 from dingo.core.posterior_models.flow_matching import FlowMatchingPosteriorModel
 from dingo.core.posterior_models.score_matching import ScoreDiffusionPosteriorModel
 from dingo.core.posterior_models.vector_copula_Model import CopulaNormalizingFlowModel
+from dingo.core.posterior_models.build_model import build_model_from_kwargs
+
