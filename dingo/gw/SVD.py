@@ -195,15 +195,17 @@ class SVDBasis(DingoDataset):
         """
         return data @ self.V
 
-    def from_file(self, filename):
+    def from_file(self, filename, dtype_map=None):
         """
         Load the SVD basis from a HDF5 file.
 
         Parameters
         ----------
         filename : str
+        dtype_map : dict, optional
+            Passed through to `DingoDataset.from_file`.
         """
-        super().from_file(filename)
+        super().from_file(filename, dtype_map=dtype_map)
         if self.V is None:
             raise KeyError("File does not contain SVD V matrix. No SVD basis to load.")
         self.Vh = self.V.T.conj()
@@ -256,19 +258,22 @@ class ApplySVD(object):
         self.svd_basis = svd_basis
         self.inverse = inverse
 
-    def __call__(self, waveform: dict):
+    def __call__(self, input_sample: dict):
         """
         Parameters
         ----------
-        waveform : dict
-            Values should be arrays containing waveforms to be transformed.
+        input_sample : dict
+            input_sample["waveform"] should be a dict with arrays containing waveforms
+            to be transformed.
 
         Returns
         -------
         dict of the same form as the input, but with transformed waveforms.
         """
+        sample = input_sample.copy()
         if not self.inverse:
             func = self.svd_basis.compress
         else:
             func = self.svd_basis.decompress
-        return {k: func(v) for k, v in waveform.items()}
+        sample["waveform"] = {k: func(v) for k, v in sample["waveform"].items()}
+        return sample

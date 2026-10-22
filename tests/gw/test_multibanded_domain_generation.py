@@ -1,0 +1,773 @@
+"""
+Tests for generate_multibanded_domain.py, evaluate_multibanded_domain.py, and
+_multibanded_domain_utils.py.
+
+Tests for the top-level generate_multibanded_domain_settings and
+_evaluate_multibanding_main functions (which require waveform generation) are not
+included here; those are covered by integration tests.
+"""
+
+import os
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+import pytest
+from bilby.core.prior import DeltaFunction
+
+from dingo.gw.dataset._multibanded_domain_utils import build_extreme_prior
+from dingo.gw.dataset.evaluate_multibanded_domain import _evaluate_multibanding_main
+from dingo.gw.dataset.generate_multibanded_domain import (
+    _build_mfd_for_threshold,
+    _compute_mismatches,
+    _load_asd,
+    _output_settings_path,
+    _same_nodes,
+    compute_max_decimation_factor,
+    compute_waveform_difference_per_decimation_factor,
+    floor_to_power_of_2,
+    get_band_nodes_for_adaptive_decimation,
+)
+from dingo.gw.domains import MultibandedFrequencyDomain, UniformFrequencyDomain
+from dingo.gw.prior import default_intrinsic_dict
+
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+INTRINSIC_PRIOR = default_intrinsic_dict
+
+
+@pytest.fixture
+def settings():
+    return {"intrinsic_prior": INTRINSIC_PRIOR.copy()}
+
+
+@pytest.fixture
+def ufd():
+    return UniformFrequencyDomain(f_min=20.0, f_max=256.0, delta_f=1.0)
+
+
+@pytest.fixture
+def ufd_2x(ufd):
+    return UniformFrequencyDomain(
+        f_min=ufd.f_min, f_max=ufd.f_max, delta_f=ufd.delta_f / 2
+    )
+
+
+@pytest.fixture
+def mfd(ufd):
+    # Two bands: [20, 64) with dec=1, [64, 256) with dec=2
+    return MultibandedFrequencyDomain(
+        nodes=[20.0, 64.0, 256.0],
+        delta_f_initial=1.0,
+        base_domain=ufd,
+    )
+
+
+# ---------------------------------------------------------------------------
+# floor_to_power_of_2
+# ---------------------------------------------------------------------------
+
+
+class TestFloorToPowerOf2:
+    @pytest.mark.parametrize(
+        "x, expected",
+        [
+            (1.0, 1.0),
+            (2.0, 2.0),
+            (3.0, 2.0),
+            (4.0, 4.0),
+            (7.9, 4.0),
+            (8.0, 8.0),
+            (128.0, 128.0),
+            (129.0, 128.0),
+        ],
+    )
+    def test_values(self, x, expected):
+        assert floor_to_power_of_2(x) == expected
+
+
+# ---------------------------------------------------------------------------
+# get_band_nodes_for_adaptive_decimation
+# ---------------------------------------------------------------------------
+
+
+class TestGetBandNodesForAdaptiveDecimation:
+    def test_all_ones_gives_single_band(self):
+        max_dec = np.ones(100)
+        initial_ds, nodes = get_band_nodes_for_adaptive_decimation(max_dec)
+        assert initial_ds == 1
+        assert nodes[0] == 0
+        assert nodes[-1] == len(max_dec)
+
+    def test_nodes_start_at_zero(self):
+        max_dec = np.concatenate([np.ones(50), 4 * np.ones(50)])
+        _, nodes = get_band_nodes_for_adaptive_decimation(max_dec)
+        assert nodes[0] == 0
+
+    def test_nodes_monotonically_increasing(self):
+        max_dec = np.concatenate([np.ones(32), 2 * np.ones(32), 4 * np.ones(32)])
+        _, nodes = get_band_nodes_for_adaptive_decimation(max_dec)
+        assert all(nodes[i] < nodes[i + 1] for i in range(len(nodes) - 1))
+
+    def test_global_max_dec_factor_clipping(self):
+        max_dec = np.concatenate([np.ones(16), 2 * np.ones(16), 4 * np.ones(32)])
+        initial_ds, _ = get_band_nodes_for_adaptive_decimation(
+            max_dec, max_dec_factor_global=2
+        )
+        assert initial_ds <= 2
+
+    def test_raises_for_non_monotonic_input(self):
+        max_dec = np.array([1.0, 2.0, 1.0])
+        with pytest.raises(ValueError):
+            get_band_nodes_for_adaptive_decimation(max_dec)
+
+    def test_raises_for_2d_input(self):
+        max_dec = np.ones((10, 10))
+        with pytest.raises(ValueError):
+            get_band_nodes_for_adaptive_decimation(max_dec)
+
+
+# ---------------------------------------------------------------------------
+# compute_max_decimation_factor
+# ---------------------------------------------------------------------------
+
+
+class TestComputeMaxDecimationFactor:
+    def test_shape(self, ufd):
+        decimation_factors = np.array([2, 4])
+        n = len(ufd()) // 2
+        diffs = [np.zeros(n), np.zeros(n)]
+        freqs = [np.linspace(0, ufd.f_max, n), np.linspace(0, ufd.f_max, n)]
+        result = compute_max_decimation_factor(
+            decimation_factors, diffs, freqs, ufd, threshold=0.1
+        )
+        assert result.shape == (len(ufd()),)
+
+    def test_result_monotonically_nondecreasing(self, ufd):
+        # Monotonically decreasing diff → decimation factor increases with frequency
+        decimation_factors = np.array([2, 4])
+        n = len(ufd()) // 2
+        diffs = [np.linspace(1.0, 0.0, n), np.linspace(1.0, 0.0, n)]
+        freqs = [np.linspace(0, ufd.f_max, n), np.linspace(0, ufd.f_max, n)]
+        result = compute_max_decimation_factor(
+            decimation_factors, diffs, freqs, ufd, threshold=0.5
+        )
+        assert np.all(result[1:] >= result[:-1])
+
+    def test_all_values_among_valid_decimation_factors(self, ufd):
+        decimation_factors = np.array([2, 4, 8])
+        n = len(ufd()) // 2
+        diffs = [np.zeros(n)] * 3
+        freqs = [np.linspace(0, ufd.f_max, n)] * 3
+        result = compute_max_decimation_factor(
+            decimation_factors, diffs, freqs, ufd, threshold=0.1
+        )
+        valid = np.concatenate([[1], decimation_factors])
+        assert all(v in valid for v in np.unique(result))
+
+
+# ---------------------------------------------------------------------------
+# compute_waveform_difference_per_decimation_factor
+# ---------------------------------------------------------------------------
+
+
+class TestComputeWaveformDifferencePerdecimationFactor:
+    def test_flat_waveforms_give_zero_difference(self, ufd, ufd_2x):
+        n_samples = 5
+        waveforms = np.ones((n_samples, len(ufd())))
+        waveforms_2x = np.ones((n_samples, len(ufd_2x())))
+        decimation_factors = np.array([2, 4])
+        diffs, freqs = compute_waveform_difference_per_decimation_factor(
+            decimation_factors, waveforms, ufd, waveforms_2x
+        )
+        for d in diffs:
+            assert np.allclose(d, 0.0, atol=1e-10)
+
+    def test_output_length_matches_decimation_factors(self, ufd, ufd_2x):
+        n_samples = 5
+        waveforms = np.random.randn(n_samples, len(ufd()))
+        waveforms_2x = np.random.randn(n_samples, len(ufd_2x()))
+        decimation_factors = np.array([2, 4, 8])
+        diffs, freqs = compute_waveform_difference_per_decimation_factor(
+            decimation_factors, waveforms, ufd, waveforms_2x
+        )
+        assert len(diffs) == len(decimation_factors)
+        assert len(freqs) == len(decimation_factors)
+
+    def test_diffs_are_nonnegative(self, ufd, ufd_2x):
+        n_samples = 10
+        waveforms = np.random.randn(n_samples, len(ufd()))
+        waveforms_2x = np.random.randn(n_samples, len(ufd_2x()))
+        decimation_factors = np.array([2])
+        diffs, _ = compute_waveform_difference_per_decimation_factor(
+            decimation_factors, waveforms, ufd, waveforms_2x
+        )
+        assert np.all(diffs[0] >= 0)
+
+    def test_diffs_are_monotonically_nonincreasing(self, ufd, ufd_2x):
+        # The cumulative max ensures the diff array is non-increasing
+        n_samples = 10
+        waveforms = np.random.randn(n_samples, len(ufd()))
+        waveforms_2x = np.random.randn(n_samples, len(ufd_2x()))
+        decimation_factors = np.array([2])
+        diffs, _ = compute_waveform_difference_per_decimation_factor(
+            decimation_factors, waveforms, ufd, waveforms_2x
+        )
+        assert np.all(diffs[0][:-1] >= diffs[0][1:])
+
+
+# ---------------------------------------------------------------------------
+# _build_mfd_for_threshold
+# ---------------------------------------------------------------------------
+
+
+class TestBuildMfdForThreshold:
+    def test_returns_valid_mfd(self, ufd, ufd_2x):
+        n_samples = 5
+        waveforms = np.ones((n_samples, len(ufd())))
+        waveforms_2x = np.ones((n_samples, len(ufd_2x())))
+        decimation_factors = np.array([2, 4])
+        diffs, freqs = compute_waveform_difference_per_decimation_factor(
+            decimation_factors, waveforms, ufd, waveforms_2x
+        )
+        mfd = _build_mfd_for_threshold(diffs, freqs, decimation_factors, ufd, 0.01, 2.0)
+        assert isinstance(mfd, MultibandedFrequencyDomain)
+        assert mfd.num_bands >= 1
+
+    def test_higher_threshold_gives_equal_or_fewer_bins(self, ufd, ufd_2x):
+        # Higher threshold → more aggressive decimation → fewer MFD bins
+        n_samples = 10
+        np.random.seed(0)
+        waveforms = np.random.randn(n_samples, len(ufd()))
+        waveforms_2x = np.random.randn(n_samples, len(ufd_2x()))
+        decimation_factors = np.array([2, 4, 8])
+        diffs, freqs = compute_waveform_difference_per_decimation_factor(
+            decimation_factors, waveforms, ufd, waveforms_2x
+        )
+        mfd_conservative = _build_mfd_for_threshold(
+            diffs, freqs, decimation_factors, ufd, 1e-4, 2.0
+        )
+        mfd_aggressive = _build_mfd_for_threshold(
+            diffs, freqs, decimation_factors, ufd, 1.0, 2.0
+        )
+        assert len(mfd_aggressive()) <= len(mfd_conservative())
+
+
+# ---------------------------------------------------------------------------
+# _compute_mismatches
+# ---------------------------------------------------------------------------
+
+
+class TestComputeMismatches:
+    def test_mismatches_in_unit_interval(self, ufd, mfd):
+        n_samples = 5
+        rng = np.random.default_rng(0)
+        waveforms = rng.standard_normal(
+            (n_samples, len(ufd()))
+        ) + 1j * rng.standard_normal((n_samples, len(ufd())))
+        polarizations = {"h_plus": waveforms}
+        asd = np.ones(len(ufd()))
+        mismatches = _compute_mismatches(polarizations, ufd, mfd, asd)
+        assert mismatches.shape == (n_samples,)
+        assert np.all(mismatches >= 0)
+        assert np.all(mismatches <= 1)
+
+    def test_constant_waveform_gives_near_zero_mismatch(self, ufd, mfd):
+        # A constant complex waveform is perfectly preserved by decimation + interpolation
+        n_samples = 3
+        constant = np.ones(len(ufd()), dtype=complex)
+        polarizations = {"h_plus": np.stack([constant] * n_samples)}
+        asd = np.ones(len(ufd()))
+        mismatches = _compute_mismatches(polarizations, ufd, mfd, asd)
+        assert np.allclose(mismatches, 0.0, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# _output_settings_path
+# ---------------------------------------------------------------------------
+
+
+class TestOutputSettingsPath:
+    def test_replaces_ufd_with_mfd(self):
+        path = _output_settings_path("/some/dir/settings_wfd_ufd.yaml")
+        assert os.path.basename(path) == "settings_wfd_mfd.yaml"
+        assert os.path.dirname(path) == "/some/dir"
+
+    def test_replaces_ufd_suffix_in_longer_name(self):
+        path = _output_settings_path("/data/settings_wfd_ufd_32s.yaml")
+        assert os.path.basename(path) == "settings_wfd_mfd_32s.yaml"
+
+    def test_appends_mfd_when_ufd_absent(self):
+        path = _output_settings_path("/some/dir/settings_wfd.yaml")
+        assert os.path.basename(path) == "settings_wfd_mfd.yaml"
+
+    def test_output_in_same_directory_as_input(self):
+        path = _output_settings_path("/some/dir/settings_wfd_ufd.yaml")
+        assert os.path.dirname(path) == "/some/dir"
+
+
+# ---------------------------------------------------------------------------
+# build_extreme_prior
+# ---------------------------------------------------------------------------
+
+
+class TestBuildExtremePrior:
+    def test_chirp_mass_fixed_at_nominal_minimum(self, settings):
+        from dingo.gw.prior import build_prior_with_defaults
+
+        nominal_minimum = build_prior_with_defaults(settings["intrinsic_prior"])[
+            "chirp_mass"
+        ].minimum
+        prior = build_extreme_prior(settings)
+        # chirp_mass is a negligibly narrow Uniform rather than a DeltaFunction, so that
+        # the mass_1/mass_2 Constraint priors can still be sampled; see
+        # build_extreme_prior.
+        assert prior["chirp_mass"].minimum == nominal_minimum
+        assert prior["chirp_mass"].maximum == pytest.approx(nominal_minimum, rel=1e-8)
+
+    def test_geocent_time_fixed_at_boundary(self, settings):
+        prior = build_extreme_prior(settings)
+        assert isinstance(prior["geocent_time"], DeltaFunction)
+        assert prior["geocent_time"].peak == 0.12
+
+    def test_input_settings_not_mutated(self, settings):
+        original_chirp_mass = settings["intrinsic_prior"]["chirp_mass"]
+        original_geocent_time = settings["intrinsic_prior"]["geocent_time"]
+        build_extreme_prior(settings)
+        assert settings["intrinsic_prior"]["chirp_mass"] == original_chirp_mass
+        assert settings["intrinsic_prior"]["geocent_time"] == original_geocent_time
+
+    def test_other_parameters_unchanged(self, settings):
+        from dingo.gw.prior import build_prior_with_defaults
+
+        nominal = build_prior_with_defaults(settings["intrinsic_prior"])
+        extreme = build_extreme_prior(settings)
+        for key in nominal:
+            if key in ("chirp_mass", "geocent_time"):
+                continue
+            assert str(extreme[key]) == str(nominal[key])
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_multibanding_main
+# ---------------------------------------------------------------------------
+
+MFD_SETTINGS = {
+    "domain": {
+        "type": "MultibandedFrequencyDomain",
+        "nodes": [20.0, 64.0, 256.0],
+        "delta_f_initial": 1.0,
+        "base_domain": {
+            "type": "UniformFrequencyDomain",
+            "f_min": 20.0,
+            "f_max": 256.0,
+            "delta_f": 1.0,
+        },
+    },
+    "waveform_generator": {
+        "approximant": "IMRPhenomPv2",
+        "f_ref": 20.0,
+        "new_interface": False,
+    },
+    "intrinsic_prior": INTRINSIC_PRIOR,
+}
+
+
+@pytest.fixture
+def mfd_settings_file(tmp_path):
+    import yaml
+
+    path = tmp_path / "settings_wfd_mfd.yaml"
+    with open(path, "w") as f:
+        yaml.dump(MFD_SETTINGS, f)
+    return str(path)
+
+
+class TestEvaluateMultibandingMain:
+    def test_raises_for_ufd_settings(self, tmp_path):
+        import yaml
+
+        ufd_settings = dict(MFD_SETTINGS)
+        ufd_settings["domain"] = {
+            "type": "UniformFrequencyDomain",
+            "f_min": 20.0,
+            "f_max": 256.0,
+            "delta_f": 1.0,
+        }
+        path = str(tmp_path / "settings_ufd.yaml")
+        with open(path, "w") as f:
+            yaml.dump(ufd_settings, f)
+        with pytest.raises(ValueError, match="MultibandedFrequencyDomain"):
+            _evaluate_multibanding_main(path, num_samples=2)
+
+    def test_uses_extreme_prior(self, mfd_settings_file):
+        """Verify that the extreme prior (min chirp mass, geocent_time=0.12) is applied."""
+        captured_prior = {}
+
+        def mock_generate(waveform_generator, prior, num_samples, num_processes):
+            captured_prior["prior"] = prior
+            ufd = waveform_generator.domain
+            n = len(ufd())
+            pols = {
+                "h_plus": np.ones((num_samples, n), dtype=complex),
+                "h_cross": np.ones((num_samples, n), dtype=complex),
+            }
+            return pd.DataFrame({"dummy": range(num_samples)}), pols
+
+        def mock_parallel(waveform_generator, parameters):
+            ufd = waveform_generator.domain
+            n = len(ufd())
+            return {
+                "h_plus": np.ones((len(parameters), n), dtype=complex),
+                "h_cross": np.ones((len(parameters), n), dtype=complex),
+            }
+
+        with (
+            patch(
+                "dingo.gw.dataset.evaluate_multibanded_domain.generate_parameters_and_polarizations",
+                side_effect=mock_generate,
+            ),
+            patch(
+                "dingo.gw.dataset.evaluate_multibanded_domain.generate_waveforms_parallel",
+                side_effect=mock_parallel,
+            ),
+        ):
+            _evaluate_multibanding_main(mfd_settings_file, num_samples=2)
+
+        from dingo.gw.prior import build_prior_with_defaults
+
+        nominal_minimum = build_prior_with_defaults(INTRINSIC_PRIOR)[
+            "chirp_mass"
+        ].minimum
+        prior = captured_prior["prior"]
+        assert prior["chirp_mass"].minimum == nominal_minimum
+        assert prior["chirp_mass"].maximum == pytest.approx(nominal_minimum, rel=1e-8)
+        assert isinstance(prior["geocent_time"], DeltaFunction)
+        assert prior["geocent_time"].peak == 0.12
+
+
+# ---------------------------------------------------------------------------
+# _load_asd
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def asd_file_with_line(tmp_path):
+    """A smooth power-law ASD covering 10-300 Hz with a narrow 2 Hz line at 100 Hz."""
+    f = np.arange(10.0, 300.0, 0.05)
+    asd = 1e-23 * (f / 100.0) ** -1.5
+    asd[np.abs(f - 100.0) < 1.0] *= 50.0
+    path = tmp_path / "line_asd.txt"
+    np.savetxt(path, np.column_stack([f, asd]))
+    return str(path)
+
+
+def test_load_asd_suppresses_narrow_line(asd_file_with_line, ufd_2x):
+    asd, asd_2x = _load_asd(asd_file_with_line, ufd_2x, smoothing_hz=8.0)
+
+    f = ufd_2x()
+    line = np.abs(f - 100.0) < 1.0
+    smooth = np.isfinite(asd_2x) & (np.abs(f - 100.0) > 10.0)
+
+    reference = 1e-23 * (np.maximum(f, ufd_2x.delta_f) / 100.0) ** -1.5
+    # The line is gone: values there follow the underlying power law.
+    assert np.allclose(asd_2x[line], reference[line], rtol=0.05)
+    # Away from the line the ASD is untouched by the opening.
+    assert np.allclose(asd_2x[smooth], reference[smooth], rtol=0.05)
+    # 1x ASD is every other sample of the 2x ASD.
+    assert np.array_equal(asd, asd_2x[::2])
+
+
+def test_load_asd_preserves_out_of_range_infs(asd_file_with_line, ufd_2x):
+    _, asd_2x = _load_asd(asd_file_with_line, ufd_2x, smoothing_hz=8.0)
+    f = ufd_2x()
+    # Erosion pulls finite values outward, dilation pushes them back, so bins outside
+    # the ASD file's frequency range must remain infinite.
+    assert np.all(np.isinf(asd_2x[f < 10.0]))
+    assert np.all(np.isfinite(asd_2x[(f >= 10.0) & (f < 300.0)]))
+
+
+# ---------------------------------------------------------------------------
+# generate_multibanded_domain_settings: threshold search
+# ---------------------------------------------------------------------------
+
+
+class TestThresholdSearchBandCountChange:
+    """The bracket ends (and consecutive bisection steps) can map to MFDs with a
+    different number of bands. Comparing their nodes must not raise."""
+
+    @staticmethod
+    def _run(tmp_path, ufd):
+        import yaml
+
+        from dingo.gw.dataset import generate_multibanded_domain as gmd
+
+        settings = {
+            "domain": {
+                "type": "UniformFrequencyDomain",
+                "f_min": ufd.f_min,
+                "f_max": ufd.f_max,
+                "delta_f": ufd.delta_f,
+            },
+            "intrinsic_prior": INTRINSIC_PRIOR,
+        }
+        settings_file = str(tmp_path / "settings_ufd.yaml")
+        with open(settings_file, "w") as f:
+            yaml.dump(settings, f)
+
+        # Three bands below threshold 1 (meets target), two bands above (misses it).
+        # The bracketing walk from 5e-3 ends at [0.32, 5.12], straddling the change.
+        fine = MultibandedFrequencyDomain(
+            nodes=[20.0, 64.0, 128.0, 256.0], delta_f_initial=1.0, base_domain=ufd
+        )
+        coarse = MultibandedFrequencyDomain(
+            nodes=[20.0, 64.0, 256.0], delta_f_initial=1.0, base_domain=ufd
+        )
+
+        def mock_build(diffs, freqs, dec, ufd_, threshold, *args, **kwargs):
+            return fine if threshold < 1.0 else coarse
+
+        def mock_mismatches(polarizations, ufd_, mfd, asd):
+            return np.full(4, 1e-4 if mfd.num_bands == 3 else 1e-2)
+
+        with (
+            patch.object(
+                gmd,
+                "_generate_whitened_waveforms",
+                return_value=(
+                    ufd,
+                    None,
+                    None,
+                    {"h_cross": None},
+                    {"h_cross": None},
+                    None,
+                ),
+            ),
+            patch.object(
+                gmd,
+                "compute_waveform_difference_per_decimation_factor",
+                return_value=([], []),
+            ),
+            patch.object(gmd, "_build_mfd_for_threshold", side_effect=mock_build),
+            patch.object(gmd, "_compute_mismatches", side_effect=mock_mismatches),
+        ):
+            output_path = gmd.generate_multibanded_domain_settings(
+                settings_file, num_samples=4, target_median_mismatch=1e-3
+            )
+        with open(output_path, "r") as f:
+            return yaml.safe_load(f)
+
+    def test_bracket_with_different_band_counts(self, tmp_path, ufd):
+        out = self._run(tmp_path, ufd)
+        assert out["domain"]["nodes"] == [20.0, 64.0, 128.0, 256.0]
+
+
+class TestSameNodes:
+    def test_identical_nodes(self):
+        assert _same_nodes(np.array([20.0, 64.0, 256.0]), np.array([20.0, 64.0, 256.0]))
+
+    def test_different_nodes_same_length(self):
+        assert not _same_nodes(
+            np.array([20.0, 64.0, 256.0]), np.array([20.0, 80.0, 256.0])
+        )
+
+    def test_different_number_of_bands(self):
+        assert not _same_nodes(
+            np.array([20.0, 64.0, 128.0, 256.0]), np.array([20.0, 64.0, 256.0])
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase heterodyning (DINGO-BNS)
+# ---------------------------------------------------------------------------
+
+
+class TestHeterodynePolarizations:
+    def test_identity_without_setting(self, ufd):
+        from dingo.gw.dataset._multibanded_domain_utils import heterodyne_polarizations
+
+        pols = {"h_plus": np.ones((3, len(ufd())), dtype=complex)}
+        params = pd.DataFrame({"chirp_mass": [1.2, 1.3, 1.4]})
+        assert heterodyne_polarizations(pols, ufd, params, {}) is pols
+
+    @pytest.mark.parametrize("order", [0, 2])
+    def test_heterodynes_each_row_at_alternating_offset(self, ufd, order):
+        from dingo.gw.dataset._multibanded_domain_utils import heterodyne_polarizations
+        from dingo.gw.transforms import factor_fiducial_waveform
+
+        rng = np.random.default_rng(0)
+        pols = {
+            k: rng.standard_normal((3, len(ufd())))
+            + 1j * rng.standard_normal((3, len(ufd())))
+            for k in ("h_plus", "h_cross")
+        }
+        params = pd.DataFrame(
+            {"chirp_mass": [1.2, 1.3, 1.4], "mass_ratio": [0.7, 0.8, 0.9]}
+        )
+        settings = {"compression": {"phase_heterodyning": {"order": order}}}
+        out = heterodyne_polarizations(
+            pols, ufd, params, settings, chirp_mass_proxy_offset=0.005
+        )
+        for k in pols:
+            for i in range(3):
+                expected = factor_fiducial_waveform(
+                    pols[k][i],
+                    ufd,
+                    1.2 + 0.1 * i + (-1) ** i * 0.005,
+                    [0.7, 0.8, 0.9][i],
+                    order=order,
+                )
+                np.testing.assert_allclose(out[k][i], expected)
+
+
+BNS_UFD_SETTINGS = {
+    "domain": {
+        "type": "UniformFrequencyDomain",
+        "f_min": 20.0,
+        "f_max": 256.0,
+        "delta_f": 1 / 64,
+    },
+    "waveform_generator": {
+        "approximant": "IMRPhenomXP_NRTidalv3",
+        "f_ref": 20.0,
+        "spin_conversion_phase": 0.0,
+    },
+    "intrinsic_prior": {
+        "mass_1": "bilby.core.prior.Constraint(minimum=1.0, maximum=2.5)",
+        "mass_2": "bilby.core.prior.Constraint(minimum=1.0, maximum=2.5)",
+        "chirp_mass": "bilby.gw.prior.UniformInComponentsChirpMass(minimum=1.2, maximum=1.4)",
+        "mass_ratio": "bilby.gw.prior.UniformInComponentsMassRatio(minimum=0.5, maximum=1.0)",
+        "a_1": "bilby.core.prior.Uniform(minimum=0.0, maximum=0.05)",
+        "a_2": "bilby.core.prior.Uniform(minimum=0.0, maximum=0.05)",
+        "tilt_1": "default",
+        "tilt_2": "default",
+        "phi_12": "default",
+        "phi_jl": "default",
+        "theta_jn": "default",
+        "phase": "default",
+        "lambda_1": "default",
+        "lambda_2": "default",
+        "luminosity_distance": 100.0,
+        "geocent_time": 0.0,
+    },
+    "compression": {
+        "whitening": "aLIGO_ZERO_DET_high_P_asd.txt",
+        "phase_heterodyning": {"order": 0},
+    },
+}
+
+
+def test_heterodyned_waveforms_decimate_further(tmp_path):
+    """For a heterodyned (DINGO-BNS) dataset, the bands are determined from heterodyned
+    waveforms, which allows far coarser bands at the same mismatch; a larger proxy
+    offset leaves more residual oscillation and hence no coarser bands."""
+    import yaml
+
+    from dingo.gw.dataset.generate_multibanded_domain import (
+        generate_multibanded_domain_settings,
+    )
+    from dingo.gw.domains import build_domain
+
+    def num_bins(settings, offset):
+        path = (
+            tmp_path
+            / f"settings_ufd_{offset}_{'phase_heterodyning' in settings['compression']}.yaml"
+        )
+        with open(path, "w") as f:
+            yaml.dump(settings, f)
+        out = generate_multibanded_domain_settings(
+            str(path),
+            num_samples=4,
+            target_median_mismatch=1e-3,
+            chirp_mass_proxy_offset=offset,
+        )
+        with open(out) as f:
+            return len(build_domain(yaml.safe_load(f)["domain"]))
+
+    plain = dict(
+        BNS_UFD_SETTINGS, compression={"whitening": "aLIGO_ZERO_DET_high_P_asd.txt"}
+    )
+    bins_plain = num_bins(plain, 0.0)
+    bins_het = num_bins(BNS_UFD_SETTINGS, 0.0)
+    bins_het_offset = num_bins(BNS_UFD_SETTINGS, 0.02)
+    assert bins_het < bins_plain / 2
+    assert bins_het <= bins_het_offset < bins_plain
+
+
+def test_alternating_offset_covers_both_kernel_edges(tmp_path, monkeypatch):
+    """The bands must serve a proxy on either side of the true chirp mass. The residual
+    oscillation differs between the two sides (the offset term of the phase adds to or
+    cancels against the post-Newtonian remainder), so a domain determined from one
+    side alone fails on the other; the alternating-sign offset covers both."""
+    import yaml
+    from bilby.core.utils import random as bilby_random
+
+    import dingo.gw.dataset.generate_multibanded_domain as gmd
+    from dingo.gw.dataset._multibanded_domain_utils import (
+        build_extreme_prior,
+        heterodyne_polarizations,
+    )
+    from dingo.gw.domains import build_domain
+    from dingo.gw.transforms import factor_fiducial_waveform
+
+    path = tmp_path / "settings_ufd.yaml"
+    with open(path, "w") as f:
+        yaml.dump(BNS_UFD_SETTINGS, f)
+    target, delta = 1e-3, 0.005
+
+    def domain_from(sign):
+        # sign=None: the tool as shipped (alternating); otherwise one-sided heterodyning.
+        if sign is None:
+            monkeypatch.setattr(
+                gmd, "heterodyne_polarizations", heterodyne_polarizations
+            )
+        else:
+            monkeypatch.setattr(
+                gmd,
+                "heterodyne_polarizations",
+                lambda pols, domain, params, settings, offset: heterodyne_polarizations(
+                    pols,
+                    domain,
+                    params.assign(chirp_mass=params["chirp_mass"] + sign * offset),
+                    settings,
+                ),
+            )
+        bilby_random.seed(0)
+        out = gmd.generate_multibanded_domain_settings(
+            str(path),
+            num_samples=8,
+            target_median_mismatch=target,
+            chirp_mass_proxy_offset=delta,
+        )
+        with open(out) as f:
+            return build_domain(yaml.safe_load(f)["domain"])
+
+    mfd_alternating = domain_from(None)
+    mfd_minus = domain_from(-1.0)
+
+    # Fresh waveforms, heterodyned at either edge of the kernel.
+    plain = dict(
+        BNS_UFD_SETTINGS, compression={"whitening": "aLIGO_ZERO_DET_high_P_asd.txt"}
+    )
+    bilby_random.seed(1)
+    ufd, parameters, pols, _, _, asd = gmd._generate_whitened_waveforms(
+        plain, build_extreme_prior(plain), gmd._get_asd_file(plain), 16
+    )
+
+    def median_mismatch(mfd, sign):
+        chirp_mass = parameters["chirp_mass"].to_numpy() + sign * delta
+        het = {k: factor_fiducial_waveform(v, ufd, chirp_mass) for k, v in pols.items()}
+        return np.median(gmd._compute_mismatches(het, ufd, mfd, asd))
+
+    print(
+        f"\nalternating ({len(mfd_alternating)} bins): +delta "
+        f"{median_mismatch(mfd_alternating, 1.0):.2e}, -delta "
+        f"{median_mismatch(mfd_alternating, -1.0):.2e}; -delta-only "
+        f"({len(mfd_minus)} bins): +delta {median_mismatch(mfd_minus, 1.0):.2e}"
+    )
+    assert median_mismatch(mfd_alternating, 1.0) <= 2 * target
+    assert median_mismatch(mfd_alternating, -1.0) <= 2 * target
+    # The domain determined from one side alone is worse on the side it never saw.
+    assert median_mismatch(mfd_minus, 1.0) > median_mismatch(mfd_alternating, 1.0)

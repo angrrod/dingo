@@ -1,13 +1,13 @@
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 import h5py
 import numpy as np
 import torch.utils.data
 from torchvision.transforms import Compose
 
-from dingo.core.dataset import DingoDataset, recursive_hdf5_load
+from dingo.core.dataset import DingoDataset, DTypeMap, recursive_hdf5_load
 from dingo.gw.SVD import SVDBasis, ApplySVD
 from dingo.gw.domains import build_domain
-from dingo.gw.transforms import WhitenFixedASD
+from dingo.gw.transforms import HeterodynePhase, WhitenFixedASD
 
 
 class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
@@ -33,7 +33,7 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
         file_name: Optional[str] = None,
         dictionary: Optional[dict] = None,
         transform=None,
-        precision: Optional[str] = None,
+        precision: Optional[Literal["single", "double"]] = None,
         domain_update: Optional[dict] = None,
         svd_size_update: Optional[int] = None,
         leave_waveforms_on_disk: Optional[bool] = False,
@@ -76,6 +76,7 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
             dictionary=dictionary,
             data_keys=["parameters", "polarizations", "svd"],
             leave_on_disk_keys=leave_on_disk_keys,
+            dtype_map=self.dtype_map,
         )
         self.file_name = file_name
 
@@ -107,20 +108,8 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
         # particular, this zeroes the waveforms for f < f_min.
         self.update_domain(domain_update)
 
-        # Update dtypes if necessary
-        if self.precision is not None:
-            if self.parameters is not None:
-                self.parameters = self.parameters.astype(self.real_type, copy=False)
-            if self.polarizations is not None:
-                for k, v in self.polarizations.items():
-                    self.polarizations[k] = v.astype(self.complex_type, copy=False)
-
-            # This should probably be moved to the SVDBasis class.
-            if self.svd is not None:
-                self.svd["V"] = self.svd["V"].astype(self.complex_type, copy=False)
-                # For backward compatibility; in future, this will be there.
-                if "s" in self.svd:
-                    self.svd["s"] = self.svd["s"].astype(self.real_type, copy=False)
+        # Note: dtype conversion for parameters, polarizations, and svd is now handled
+        # during HDF5 loading via dtype_map, avoiding intermediate memory allocation.
 
         if self.settings.get("compression", None) is not None:
             self.initialize_decompression(svd_size_update)
@@ -162,7 +151,8 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
     def initialize_decompression(self, svd_size_update: Optional[int] = None):
         """
         Sets up decompression transforms. These are applied to the raw dataset before
-        self.transform. E.g., SVD decompression.
+        self.transform, in reverse order of the compression: SVD decompression, inverse
+        phase heterodyning, un-whitening.
 
         Parameters
         ----------
@@ -196,6 +186,15 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
             svd_basis = SVDBasis(dictionary=self.svd)
             decompression_transform_list.append(ApplySVD(svd_basis, inverse=True))
 
+        if "phase_heterodyning" in self.settings["compression"]:
+            decompression_transform_list.append(
+                HeterodynePhase(
+                    self.domain,
+                    inverse=True,
+                    **self.settings["compression"]["phase_heterodyning"],
+                )
+            )
+
         if "whitening" in self.settings["compression"]:
             decompression_transform_list.append(
                 WhitenFixedASD(
@@ -209,30 +208,24 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
         self.decompression_transform = Compose(decompression_transform_list)
 
     @property
-    def real_type(self):
-        if self.precision is not None:
-            if self.precision == "single":
-                return np.float32
-            elif self.precision == "double":
-                return np.float64
-            else:
-                raise TypeError(
-                    "Precision can only be changed to 'single' or 'double'."
-                )
-        else:
-            return None
+    def dtype_map(self) -> Optional[DTypeMap]:
+        """Mapping from group names to target dtypes for HDF5 loading.
 
-    @property
-    def complex_type(self):
-        if self.precision is not None:
-            if self.precision == "single":
-                return np.complex64
-            elif self.precision == "double":
-                return np.complex128
-            else:
-                raise TypeError(
-                    "Precision can only be changed to 'single' or 'double'."
-                )
+        This enables direct dtype conversion during HDF5 read, avoiding
+        intermediate memory allocation when changing precision.
+        """
+        if self.precision == "single":
+            return {
+                "parameters": np.float32,
+                "polarizations": np.complex64,
+                "svd": {"V": np.complex64, "s": np.float32},
+            }
+        elif self.precision == "double":
+            return {
+                "parameters": np.float64,
+                "polarizations": np.complex128,
+                "svd": {"V": np.complex128, "s": np.float64},
+            }
         else:
             return None
 
@@ -285,7 +278,10 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
                 self.file_handle = h5py.File(self.file_name, "r")
 
             polarizations = recursive_hdf5_load(
-                self.file_handle, keys=self._leave_on_disk_keys, idx=batched_idx
+                self.file_handle,
+                keys=self._leave_on_disk_keys,
+                idx=batched_idx,
+                dtype_map=self.dtype_map,
             )["polarizations"]
             # Apply domain update to set waveform to zero for f < f_min
             if self.svd is None:
@@ -300,12 +296,6 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
             # Convert parameters to dict
             if not isinstance(parameters, dict):
                 parameters = parameters.to_dict()
-            # Update precision
-            if self.precision is not None:
-                polarizations = {
-                    k: v.astype(self.complex_type, copy=False)
-                    for k, v in polarizations.items()
-                }
             # Perform SVD size update on waveform
             if self.svd is not None and self.svd_size_update is not None:
                 for k, v in polarizations.items():
@@ -322,13 +312,16 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
                 for pol, waveforms in self.polarizations.items()
             }
 
-        # Decompression transforms are assumed to apply only to the waveform,
-        # and do not involve parameters.
+        # Decompression transforms act on the sample dict, since some of them (the
+        # inverse phase heterodyne) depend on the parameters. They must leave the
+        # parameters untouched.
+        data = {"parameters": parameters, "waveform": polarizations}
         if self.decompression_transform is not None:
-            polarizations = self.decompression_transform(polarizations)
+            data = self.decompression_transform(data)
+            if data["parameters"] is not parameters:
+                raise ValueError("Decompression transforms must not change parameters.")
 
         # Main transforms can depend also on parameters.
-        data = {"parameters": parameters, "waveform": polarizations}
         if self.transform is not None:
             data = self.transform(data)
 

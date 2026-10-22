@@ -5,36 +5,34 @@ import yaml
 from scipy.interpolate import interp1d
 
 from dingo.gw.dataset import generate_parameters_and_polarizations
-from dingo.gw.domains import build_domain, MultibandedFrequencyDomain
-from dingo.gw.gwutils import get_mismatch
-from dingo.gw.prior import build_prior_with_defaults
-from dingo.gw.waveform_generator import (
-    NewInterfaceWaveformGenerator,
-    WaveformGenerator,
-    generate_waveforms_parallel,
+from dingo.gw.dataset._multibanded_domain_utils import (
+    build_extreme_prior,
+    heterodyne_polarizations,
+    print_mismatch_stats,
 )
+from dingo.gw.domains import MultibandedFrequencyDomain, build_domain
+from dingo.gw.gwutils import get_mismatch
+from dingo.gw.waveform_generator import (NewInterfaceWaveformGenerator,
+                                         WaveformGenerator,
+                                         generate_waveforms_parallel)
 
 
 def _evaluate_multibanding_main(
     settings_file: str,
     num_samples: int,
+    chirp_mass_proxy_offset: float = 0.0,
 ):
     with open(settings_file, "r") as f:
         settings = yaml.safe_load(f)
 
-    # Ignore any compression settings
-    if "compression" in settings:
-        del settings["compression"]
+    # Ignore any compression settings, except heterodyning: the network sees
+    # heterodyned data, so that is what the decimation must preserve.
+    heterodyning = settings.get("compression", {}).get("phase_heterodyning")
+    settings.pop("compression", None)
+    if heterodyning is not None:
+        settings["compression"] = {"phase_heterodyning": heterodyning}
 
-    # Update prior to challenge the multi-banding:
-    #
-    # (a) Set geocent_time = 0.12 s (boundary of usual prior + Earth-radius crossing time)
-    # (b) Set chirp mass to bottom end of prior.
-    prior = build_prior_with_defaults(settings["intrinsic_prior"])
-    settings["intrinsic_prior"]["geocent_time"] = 0.12
-    settings["intrinsic_prior"]["chirp_mass"] = prior["chirp_mass"].minimum
-    # Rebuild prior with updated settings.
-    prior = build_prior_with_defaults(settings["intrinsic_prior"])
+    prior = build_extreme_prior(settings)
     print("Prior")
     for k, v in prior.items():
         print(f"{k}: {v}")
@@ -73,6 +71,17 @@ def _evaluate_multibanding_main(
     # Generate UFD waveforms, re-using the parameter choices from before.
     polarizations_ufd = generate_waveforms_parallel(waveform_generator_ufd, parameters)
 
+    polarizations_mfd = heterodyne_polarizations(
+        polarizations_mfd, domain, parameters, settings, chirp_mass_proxy_offset
+    )
+    polarizations_ufd = heterodyne_polarizations(
+        polarizations_ufd,
+        domain.base_domain,
+        parameters,
+        settings,
+        chirp_mass_proxy_offset,
+    )
+
     # Compare UFD waveforms against MFD waveforms interpolated to MFD.
     mismatches = {}
     ufd = domain.base_domain
@@ -88,21 +97,8 @@ def _evaluate_multibanding_main(
                 asd_file="aLIGO_ZERO_DET_high_P_asd.txt",
             )
 
-    print("\nMismatches between UFD waveforms and MFD waveforms interpolated to MFD.")
-    print(
-        "This is a conservative estimate of the MFD performance when training "
-        "networks."
-    )
-    mismatches = np.concatenate([v for v in mismatches.values()])
-    print(f"num_samples = {num_samples}")
-    print("  Mean mismatch = {}".format(np.mean(mismatches)))
-    print("  Standard deviation = {}".format(np.std(mismatches)))
-    print("  Max mismatch = {}".format(np.max(mismatches)))
-    print("  Median mismatch = {}".format(np.median(mismatches)))
-    print("  Percentiles:")
-    print("    99    -> {}".format(np.percentile(mismatches, 99)))
-    print("    99.9  -> {}".format(np.percentile(mismatches, 99.9)))
-    print("    99.99 -> {}".format(np.percentile(mismatches, 99.99)))
+    mismatches = np.concatenate(list(mismatches.values()))
+    print_mismatch_stats(mismatches, num_samples)
 
 
 def parse_args():
@@ -111,20 +107,33 @@ def parse_args():
         description="Evaluate performance of multibanding on waveform dataset.",
     )
     parser.add_argument(
+        "--settings_file",
         "--settings-file",
         type=str,
         required=True,
         help="YAML file containing database settings",
     )
     parser.add_argument(
+        "--num_samples",
         "--num-samples",
         type=int,
         default=5000,
         help="Number of waveform evaluations for comparison.",
+    )
+    parser.add_argument(
+        "--chirp_mass_proxy_offset",
+        "--chirp-mass-proxy-offset",
+        type=float,
+        default=0.0,
+        help="For a dataset with phase_heterodyning (DINGO-BNS): heterodyne the "
+        "waveforms at their chirp mass plus or minus this offset (solar masses), "
+        "the half-width of the training kernel.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    _evaluate_multibanding_main(args.settings_file, args.num_samples)
+    _evaluate_multibanding_main(
+        args.settings_file, args.num_samples, args.chirp_mass_proxy_offset
+    )

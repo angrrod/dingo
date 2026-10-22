@@ -1,0 +1,1104 @@
+import numpy as np
+import pandas as pd
+import pytest
+from bilby.core.prior import Constraint, PowerLaw, PriorDict, Uniform
+from bilby.core.utils import random as bilby_random
+
+from dingo.gw.domains import UniformFrequencyDomain
+from dingo.gw.gwutils import get_extrinsic_prior_dict
+from dingo.gw.likelihood import StationaryGaussianGWLikelihood
+from dingo.gw.prior import build_prior_with_defaults
+from dingo.gw.result import Result
+
+
+DETECTORS = ["H1", "L1"]
+REF_TIME = 1126259462.391
+
+DOMAIN_SETTINGS = {
+    "type": "UniformFrequencyDomain",
+    "f_min": 20.0,
+    "f_max": 256.0,  # small (T=2s) so the likelihood is cheap
+    "delta_f": 0.5,
+}
+WAVEFORM_GENERATOR = {"approximant": "IMRPhenomD", "f_ref": 20.0}
+# A model whose exact mode sum uses the DFT phase decomposition.
+WAVEFORM_GENERATOR_DFT = {
+    "approximant": "IMRPhenomXPHM",
+    "f_ref": 20.0,
+    "spin_conversion_phase": 0.0,
+}
+
+INTRINSIC_PRIOR = {
+    "mass_1": "bilby.core.prior.Constraint(minimum=10.0, maximum=80.0, name='mass_1')",
+    "mass_2": "bilby.core.prior.Constraint(minimum=10.0, maximum=80.0, name='mass_2')",
+    "chirp_mass": "bilby.gw.prior.UniformInComponentsChirpMass("
+    "minimum=15.0, maximum=100.0, name='chirp_mass')",
+    "mass_ratio": "bilby.gw.prior.UniformInComponentsMassRatio("
+    "minimum=0.125, maximum=1.0, name='mass_ratio')",
+    "phase": "default",
+    "chi_1": "bilby.gw.prior.AlignedSpin(name='chi_1', a_prior=Uniform(minimum=0, maximum=0.9))",
+    "chi_2": "bilby.gw.prior.AlignedSpin(name='chi_2', a_prior=Uniform(minimum=0, maximum=0.9))",
+    "theta_jn": "default",
+    "luminosity_distance": 100.0,
+    "geocent_time": 0.0,
+}
+EXTRINSIC_PRIOR = {
+    "dec": "default",
+    "ra": "default",
+    "geocent_time": "bilby.core.prior.Uniform("
+    "minimum=-0.10, maximum=0.10, name='geocent_time')",
+    "psi": "default",
+    "luminosity_distance": "bilby.core.prior.Uniform("
+    "minimum=100.0, maximum=1000.0, name='luminosity_distance')",
+}
+# A BNS network in Bilby's spin convention, where the (2, 2) path is exact.
+WAVEFORM_GENERATOR_BNS = {
+    "approximant": "IMRPhenomXP_NRTidalv3",
+    "f_ref": 20.0,
+    "spin_conversion_phase": None,
+}
+_BNS_COMMON_PRIOR = {
+    "mass_1": "bilby.core.prior.Constraint(minimum=1.0, maximum=2.5, name='mass_1')",
+    "mass_2": "bilby.core.prior.Constraint(minimum=1.0, maximum=2.5, name='mass_2')",
+    "chirp_mass": "bilby.gw.prior.UniformInComponentsChirpMass("
+    "minimum=1.1, maximum=1.4, name='chirp_mass')",
+    "mass_ratio": "bilby.gw.prior.UniformInComponentsMassRatio("
+    "minimum=0.6, maximum=1.0, name='mass_ratio')",
+    "phase": "default",
+    "theta_jn": "default",
+    "luminosity_distance": 100.0,
+    "geocent_time": 0.0,
+    "lambda_1": "bilby.core.prior.Uniform(minimum=0.0, maximum=3000.0, name='lambda_1')",
+    "lambda_2": "bilby.core.prior.Uniform(minimum=0.0, maximum=3000.0, name='lambda_2')",
+}
+BNS_PRECESSING_PRIOR = {
+    **_BNS_COMMON_PRIOR,
+    "a_1": "bilby.core.prior.Uniform(minimum=0.0, maximum=0.05, name='a_1')",
+    "a_2": "bilby.core.prior.Uniform(minimum=0.0, maximum=0.05, name='a_2')",
+    "tilt_1": "default",
+    "tilt_2": "default",
+    "phi_12": "default",
+    "phi_jl": "default",
+}
+# Aligned spins.
+BNS_ALIGNED_PRIOR = {
+    **_BNS_COMMON_PRIOR,
+    "chi_1": "bilby.gw.prior.AlignedSpin(name='chi_1', a_prior=Uniform(minimum=0, maximum=0.05))",
+    "chi_2": "bilby.gw.prior.AlignedSpin(name='chi_2', a_prior=Uniform(minimum=0, maximum=0.05))",
+}
+
+
+def _metadata(waveform_generator=WAVEFORM_GENERATOR, intrinsic_prior=INTRINSIC_PRIOR):
+    return {
+        "dataset_settings": {
+            "domain": DOMAIN_SETTINGS,
+            "waveform_generator": waveform_generator,
+            "intrinsic_prior": intrinsic_prior,
+        },
+        "train_settings": {
+            "data": {
+                "detectors": DETECTORS,
+                "ref_time": REF_TIME,
+                "extrinsic_prior": EXTRINSIC_PRIOR,
+            }
+        },
+    }
+
+
+def _context():
+    """Synthetic strain + ASD context (constant above f_min, masked below)."""
+    domain = UniformFrequencyDomain(
+        DOMAIN_SETTINGS["f_min"], DOMAIN_SETTINGS["f_max"], DOMAIN_SETTINGS["delta_f"]
+    )
+    mask = domain.frequency_mask
+    waveform = {d: np.where(mask, (1.0 + 1j) * 1e-21, 0.0) for d in DETECTORS}
+    asds = {d: np.where(mask, 1e-21, 1.0) for d in DETECTORS}
+    return {"waveform": waveform, "asds": asds}
+
+
+def make_gw_result(
+    n=5,
+    drop_phase=False,
+    drop_psi=False,
+    event_metadata=None,
+    waveform_generator=WAVEFORM_GENERATOR,
+    intrinsic_prior=INTRINSIC_PRIOR,
+):
+    """Build a gw Result with `n` rows drawn from its own prior (so columns/ranges are
+    consistent with the waveform generator), plus a synthetic context. The dropped
+    columns are also left out of the recorded inference parameters, as for a
+    network trained without them."""
+    full_prior = build_prior_with_defaults(
+        {**intrinsic_prior, **get_extrinsic_prior_dict(EXTRINSIC_PRIOR)}
+    )
+    samples = pd.DataFrame(full_prior.sample(n))
+    samples["log_prob"] = 0.0
+    dropped = ["phase"] * drop_phase + ["psi"] * drop_psi
+    samples = samples.drop(columns=dropped)
+    settings = _metadata(waveform_generator, intrinsic_prior)
+    settings["train_settings"]["data"]["inference_parameters"] = [
+        k for k in full_prior if k not in dropped
+    ]
+    return Result(
+        dictionary={
+            "samples": samples,
+            "context": _context(),
+            "event_metadata": {} if event_metadata is None else event_metadata,
+            "settings": settings,
+        }
+    )
+
+
+def test_legacy_injection_context_loads():
+    # Results saved from an injection dict by older code carry the emptied
+    # "extrinsic_parameters" part, and (before the sampler revamp) the truths under
+    # "parameters"; the rebuilt sampler context handles both.
+    truths = {"chirp_mass": 30.0}
+    with pytest.warns(UserWarning, match="extrinsic_parameters"):
+        result = Result(
+            dictionary={
+                "samples": make_gw_result().samples,
+                "context": {
+                    **_context(),
+                    "extrinsic_parameters": {},
+                    "parameters": truths,
+                },
+                "event_metadata": {},
+                "settings": _metadata(),
+            }
+        )
+    assert set(result.sampler_context.event_data) == {"waveform", "asds"}
+    assert result.sampler_context.event_metadata["injection_parameters"] == truths
+    assert result.prior is not None
+
+
+# ---------------------------------------------------------------------------
+# Simple property accessors
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def gw_result():
+    return make_gw_result()
+
+
+@pytest.mark.parametrize(
+    "attr, key",
+    [
+        ("synthetic_parameters_kwargs", "synthetic_parameters"),
+        ("time_marginalization_kwargs", "time_marginalization"),
+        ("phase_marginalization_kwargs", "phase_marginalization"),
+        ("calibration_marginalization_kwargs", "calibration_marginalization"),
+        ("calibration_sampling_kwargs", "calibration_sampling"),
+    ],
+)
+def test_kwargs_round_trip_via_importance_sampling_metadata(gw_result, attr, key):
+    assert getattr(gw_result, attr) is None  # not set yet
+    value = {"some": "setting"}
+    setattr(gw_result, attr, value)
+    assert getattr(gw_result, attr) == value
+    assert gw_result.importance_sampling_metadata[key] == value
+
+
+def test_use_base_domain_default_and_noop_on_uniform_domain(gw_result):
+    # UniformFrequencyDomain has no base_domain, so the setter is a no-op.
+    assert gw_result.use_base_domain is False
+    gw_result.use_base_domain = True
+    assert gw_result.use_base_domain is False
+
+
+def test_f_ref_and_approximant(gw_result):
+    assert gw_result.f_ref == WAVEFORM_GENERATOR["f_ref"]
+    assert gw_result.approximant == WAVEFORM_GENERATOR["approximant"]
+
+
+def test_t_ref_defaults_to_ref_time(gw_result):
+    assert gw_result.t_ref == REF_TIME
+
+
+def test_t_ref_uses_event_time_when_present():
+    result = make_gw_result(event_metadata={"time_event": REF_TIME + 100.0})
+    assert result.t_ref == REF_TIME + 100.0
+
+
+def test_minimum_maximum_frequency_default_to_domain(gw_result):
+    assert gw_result.minimum_frequency == gw_result.domain.f_min
+    assert gw_result.maximum_frequency == gw_result.domain.f_max
+
+
+def test_minimum_maximum_frequency_override_and_setter(gw_result):
+    result = make_gw_result(
+        event_metadata={"minimum_frequency": 30.0, "maximum_frequency": 200.0}
+    )
+    assert result.minimum_frequency == 30.0
+    assert result.maximum_frequency == 200.0
+
+    gw_result.minimum_frequency = 25.0
+    assert gw_result.event_metadata["minimum_frequency"] == 25.0
+    assert gw_result.minimum_frequency == 25.0
+
+
+def test_interferometers(gw_result):
+    assert gw_result.interferometers == DETECTORS
+
+
+def test_build_domain_creates_uniform_frequency_domain(gw_result):
+    assert isinstance(gw_result.domain, UniformFrequencyDomain)
+    assert gw_result.domain.f_min == DOMAIN_SETTINGS["f_min"]
+    assert gw_result.domain.f_max == DOMAIN_SETTINGS["f_max"]
+
+
+# ---------------------------------------------------------------------------
+# Likelihood tests
+# ---------------------------------------------------------------------------
+
+
+def test_build_likelihood(gw_result):
+    gw_result._build_likelihood()
+    assert isinstance(gw_result.likelihood, StationaryGaussianGWLikelihood)
+    assert np.isfinite(gw_result.likelihood.log_Zn)
+
+
+def test_importance_sample_populates_columns_and_evidence(gw_result):
+    gw_result.importance_sample(num_processes=1)
+    for col in ("log_prior", "log_likelihood", "weights"):
+        assert col in gw_result.samples.columns
+    assert np.isfinite(gw_result.log_evidence)
+    assert np.isfinite(gw_result.log_noise_evidence)
+    # Normalized weights have mean 1.
+    assert gw_result.samples["weights"].mean() == pytest.approx(1.0)
+
+
+def test_importance_sample_requires_log_prob():
+    result = make_gw_result()
+    result.samples = result.samples.drop(columns="log_prob")
+    with pytest.raises(KeyError, match="log probability"):
+        result.importance_sample()
+
+
+def test_synthetic_phase_adds_phase_column():
+    result = make_gw_result(drop_phase=True)
+    assert "phase" not in result.samples.columns
+    log_prob_before = result.samples["log_prob"].to_numpy().copy()
+
+    result.sample_proposal_extensions(
+        synthetic_parameters_kwargs={"n_grid_phase": 16, "approximation_22_mode": True}
+    )
+
+    assert "phase" in result.samples.columns
+    phase = result.samples["phase"].to_numpy()
+    assert np.all((phase >= 0) & (phase < 2 * np.pi))
+    # log_prob is updated with the synthetic-phase conditional.
+    assert not np.array_equal(result.samples["log_prob"].to_numpy(), log_prob_before)
+
+
+@pytest.mark.parametrize(
+    "inexact",
+    [{"approximation_22_mode": True}, {"use_dft_phase_decomposition": False}],
+)
+def test_synthetic_phase_caches_only_when_exact(inexact):
+    # The (2, 2) approximation and the individual-mode decomposition do not reproduce
+    # a direct likelihood call, so they cache nothing, and a stale cache is dropped.
+    result = make_gw_result(drop_phase=True, waveform_generator=WAVEFORM_GENERATOR_DFT)
+    result.samples["log_likelihood_cache"] = 0.0
+    result.sample_proposal_extensions(
+        synthetic_parameters_kwargs={
+            "n_grid_phase": 16,
+            "approximation_22_mode": False,
+            **inexact,
+        }
+    )
+    assert "log_likelihood_cache" not in result.samples.columns
+
+
+def test_synthetic_phase_cache_matches_direct_importance_sampling(
+    tmp_path, monkeypatch
+):
+    # In exact mode with the DFT phase decomposition the synthetic phase caches the
+    # log likelihood at the drawn phase. After a save / reload, importance sampling
+    # uses it without evaluating the likelihood, with the same result as a direct
+    # evaluation.
+    result = make_gw_result(drop_phase=True, waveform_generator=WAVEFORM_GENERATOR_DFT)
+    result.sample_proposal_extensions(
+        synthetic_parameters_kwargs={"n_grid_phase": 16, "approximation_22_mode": False}
+    )
+    assert np.all(np.isfinite(result.samples["log_likelihood_cache"]))
+    file_name = str(tmp_path / "result.hdf5")
+    result.to_file(file_name=file_name)
+
+    cached = Result(file_name=file_name)
+
+    def no_evaluation(*args, **kwargs):
+        raise AssertionError("the likelihood was evaluated despite the cache")
+
+    with monkeypatch.context() as m:
+        m.setattr(StationaryGaussianGWLikelihood, "log_likelihood_multi", no_evaluation)
+        cached.importance_sample()
+
+    direct = Result(file_name=file_name)
+    direct.samples = direct.samples.drop(columns="log_likelihood_cache")
+    direct.importance_sample()
+    np.testing.assert_allclose(
+        cached.samples["log_likelihood"], direct.samples["log_likelihood"], atol=1e-6
+    )
+    np.testing.assert_allclose(
+        cached.samples["weights"], direct.samples["weights"], rtol=1e-6
+    )
+
+
+def test_synthetic_phase_psi_adds_both_columns():
+    from dingo.gw.inference.steps import SyntheticPhaseFactor, SyntheticPhasePsiFactor
+
+    result = make_gw_result(
+        drop_phase=True, drop_psi=True, waveform_generator=WAVEFORM_GENERATOR_DFT
+    )
+    kwargs = {
+        "n_grid_phase": 16,
+        "n_grid_psi": 8,
+        "approximation_22_mode": False,
+    }
+    step = result._synthetic_parameters_step(
+        kwargs, conditioning=list(result.prior), num_samples=len(result.samples)
+    )
+    assert isinstance(step, SyntheticPhasePsiFactor)
+    # With psi in the samples, the phase-only factor is used and n_grid_psi ignored.
+    step = make_gw_result(
+        drop_phase=True, waveform_generator=WAVEFORM_GENERATOR_DFT
+    )._synthetic_parameters_step(kwargs, conditioning=[], num_samples=100)
+    assert isinstance(step, SyntheticPhaseFactor)
+
+    log_prob_before = result.samples["log_prob"].to_numpy().copy()
+    bilby_random.seed(0)
+    np.random.seed(0)
+    result.sample_proposal_extensions(synthetic_parameters_kwargs=kwargs)
+    assert "phase" in result.prior and "psi" in result.prior
+    assert result.phase_prior is None and result.psi_prior is None
+    psi = result.samples["psi"].to_numpy()
+    assert np.all((psi >= 0) & (psi <= np.pi))
+    assert not np.array_equal(result.samples["log_prob"].to_numpy(), log_prob_before)
+    # The cached log likelihood is the exact one at the drawn (phase, psi), so
+    # importance sampling can reuse it.
+    cached = result.samples["log_likelihood_cache"].to_numpy().copy()
+    result.importance_sample()
+    assert np.allclose(result.samples["log_likelihood"].to_numpy(), cached)
+    result._build_likelihood()
+    theta = result.samples[
+        [k for k, v in result.prior.items() if not isinstance(v, Constraint)]
+    ]
+    direct = result.likelihood.log_likelihood_multi(theta)
+    assert np.allclose(cached, direct, rtol=1e-10)
+
+
+def test_phase_recovery_default_serves_both_factors():
+    # dingo_pipe's default synthetic-phase settings: 5001 phase points for the phase
+    # alone, 512 x 128 together with psi.
+    from dingo.pipe.default_settings import IMPORTANCE_SAMPLING_SETTINGS
+    from dingo.gw.inference.steps import SyntheticPhaseFactor, SyntheticPhasePsiFactor
+
+    for drop_psi, cls in (
+        (True, SyntheticPhasePsiFactor),
+        (False, SyntheticPhaseFactor),
+    ):
+        default = "PhasePsiRecoveryDefault" if drop_psi else "PhaseRecoveryDefault"
+        kwargs = IMPORTANCE_SAMPLING_SETTINGS[default]["synthetic_parameters"]
+        result = make_gw_result(
+            drop_phase=True,
+            drop_psi=drop_psi,
+            waveform_generator=WAVEFORM_GENERATOR_DFT,
+        )
+        step = result._synthetic_parameters_step(
+            kwargs, conditioning=list(result.prior), num_samples=100
+        )
+        assert isinstance(step, cls) and step.cache_log_likelihood
+        assert not step.approximation_22_mode
+        grid = (step.n_grid_phase, getattr(step, "n_grid_psi", None))
+        assert grid == ((512, 128) if drop_psi else (5001, None))
+
+
+@pytest.mark.parametrize("drop_psi", [False, True])
+@pytest.mark.parametrize(
+    "waveform_generator, intrinsic_prior, exact_22",
+    [
+        # A BNS network in Bilby's spin convention: the (2, 2) path is exact.
+        (WAVEFORM_GENERATOR_BNS, BNS_PRECESSING_PRIOR, True),
+        # Higher modes, fixed convention: the exact mode sum, as before.
+        (WAVEFORM_GENERATOR_DFT, INTRINSIC_PRIOR, False),
+    ],
+)
+def test_recovery_defaults_take_the_exact_path(
+    waveform_generator, intrinsic_prior, exact_22, drop_psi
+):
+    # Both dingo_pipe recovery defaults leave approximation_22_mode to Result, which
+    # takes the (2, 2) path where it is exact and the mode sum otherwise, for the
+    # phase alone and with psi; caching follows in either case. An explicit (2, 2)
+    # setting still wins; an explicit mode sum where it is unavailable raises, and
+    # says how to proceed.
+    from dingo.pipe.default_settings import IMPORTANCE_SAMPLING_SETTINGS
+
+    default = "PhasePsiRecoveryDefault" if drop_psi else "PhaseRecoveryDefault"
+    kwargs = IMPORTANCE_SAMPLING_SETTINGS[default]["synthetic_parameters"]
+    assert "approximation_22_mode" not in kwargs
+    result = make_gw_result(
+        drop_phase=True,
+        drop_psi=drop_psi,
+        waveform_generator=waveform_generator,
+        intrinsic_prior=intrinsic_prior,
+    )
+    step = result._synthetic_parameters_step(
+        kwargs, conditioning=list(result.prior), num_samples=100
+    )
+    assert step.approximation_22_mode is exact_22 and step.cache_log_likelihood
+    other = {**kwargs, "approximation_22_mode": not exact_22}
+    if exact_22:
+        with pytest.raises(ValueError, match="approximation_22_mode: true"):
+            result._synthetic_parameters_step(
+                other, conditioning=list(result.prior), num_samples=100
+            )
+    else:
+        step = result._synthetic_parameters_step(
+            other, conditioning=list(result.prior), num_samples=100
+        )
+        assert step.approximation_22_mode
+
+
+@pytest.mark.parametrize("drop_psi", [False, True])
+def test_no_exact_route_raises_with_the_way_out(drop_psi):
+    # An NRTidal network trained with a fixed spin convention has no exact route: the
+    # (2, 2) path is approximate, and the mode sum needs the DFT, hence a mode_list.
+    # The default (the mode sum) raises before drawing and points to the (2, 2)
+    # proposal, which then runs, without a cache.
+    waveform_generator = {**WAVEFORM_GENERATOR_BNS, "spin_conversion_phase": 0.0}
+    result = make_gw_result(
+        drop_phase=True,
+        drop_psi=drop_psi,
+        waveform_generator=waveform_generator,
+        intrinsic_prior=BNS_PRECESSING_PRIOR,
+    )
+    with pytest.raises(ValueError, match="approximation_22_mode: true"):
+        result._synthetic_parameters_step({}, list(result.prior), num_samples=100)
+    step = result._synthetic_parameters_step(
+        {"approximation_22_mode": True}, list(result.prior), num_samples=100
+    )
+    assert step.approximation_22_mode and not step.cache_log_likelihood
+
+
+def test_synthetic_phase_grid_size_settings():
+    # n_grid_phase and n_grid_psi reach the factor; the former n_grid is rejected
+    # rather than silently replaced by the default grid.
+    result = make_gw_result(drop_phase=True, drop_psi=True)
+    step = result._synthetic_parameters_step(
+        {"n_grid_phase": 16, "n_grid_psi": 8}, [], num_samples=100
+    )
+    assert (step.n_grid_phase, step.n_grid_psi) == (16, 8)
+    with pytest.raises(ValueError, match="renamed to n_grid_phase"):
+        result._synthetic_parameters_step({"n_grid": 16}, [], num_samples=100)
+
+
+def test_synthetic_phase_approximation_22_mode_reaches_both_factors():
+    # approximation_22_mode reaches the factor with and without psi. Omitted, it
+    # follows the same rule for both: here, for a higher-mode network, the mode sum.
+    from dingo.gw.inference.steps import SyntheticPhaseFactor, SyntheticPhasePsiFactor
+
+    for drop_psi, cls in (
+        (True, SyntheticPhasePsiFactor),
+        (False, SyntheticPhaseFactor),
+    ):
+        result = make_gw_result(
+            drop_phase=True,
+            drop_psi=drop_psi,
+            waveform_generator=WAVEFORM_GENERATOR_DFT,
+        )
+        for kwargs, expected in (
+            ({"approximation_22_mode": True}, True),
+            ({"approximation_22_mode": False}, False),
+            ({}, False),
+        ):
+            step = result._synthetic_parameters_step(kwargs, [], num_samples=100)
+            assert isinstance(step, cls) and step.approximation_22_mode is expected
+
+
+def test_synthetic_phase_requires_uniform_phase_prior():
+    # When `phase` is in the samples, the phase prior is not split off (it is None),
+    # so synthetic phase sampling is not applicable and must raise.
+    result = make_gw_result(drop_phase=False)
+    with pytest.raises(ValueError, match="[Pp]hase prior"):
+        result.sample_proposal_extensions(
+            synthetic_parameters_kwargs={"n_grid_phase": 16}
+        )
+
+
+def test_psi_prior_split_off_when_samples_lack_psi():
+    # As for the phase, the psi prior is split off for a network that does not
+    # infer psi, and rejoins the prior once psi is in the samples.
+    result = make_gw_result(drop_phase=True, drop_psi=True)
+    assert "psi" not in result.prior and "phase" not in result.prior
+    assert isinstance(result.psi_prior, Uniform)
+    assert result.psi_prior.maximum == pytest.approx(np.pi)
+    assert make_gw_result(drop_phase=True).psi_prior is None
+
+
+def test_synthetic_psi_requires_marginalized_phase():
+    # A network that infers the phase but not psi: recovering psi alone is not
+    # supported, and the error says so rather than blaming the phase prior.
+    result = make_gw_result(drop_psi=True)
+    with pytest.raises(ValueError, match="marginalizes the phase as well"):
+        result.sample_proposal_extensions(synthetic_parameters_kwargs={})
+
+
+def test_phase_marginalization_cannot_replace_synthetic_psi():
+    result = make_gw_result(drop_phase=True, drop_psi=True)
+    with pytest.raises(ValueError, match="cannot replace synthetic psi"):
+        result.importance_sample(phase_marginalization_kwargs={})
+
+
+def test_update_prior_routes_psi_to_split_off_prior():
+    result = make_gw_result(drop_phase=True, drop_psi=True)
+    result.update_prior(
+        {"psi": "bilby.core.prior.Uniform(minimum=0.0, maximum=1.0, name='psi')"}
+    )
+    assert "psi" not in result.prior
+    assert result.psi_prior.maximum == 1.0
+
+
+# ---------------------------------------------------------------------------
+# update_prior (importance-sampling prior reweighting)
+# ---------------------------------------------------------------------------
+#
+# The context owns the static training prior; a prior update is applied downstream
+# at the importance-sampling layer (update_prior, and _build_prior on reload). These
+# tests exercise that path on synthetic samples -- pure prior arithmetic, no waveform
+# generation. The update swaps the luminosity-distance Uniform(100, 1000) for a
+# PowerLaw on the same support, so every sample stays inside the prior and the
+# expected reweighting is exactly exp(delta log-prior), computable by hand.
+
+# String-instantiable form ({key: prior_str}), as update_prior requires for saving.
+_LD_PRIOR_UPDATE = {
+    "luminosity_distance": "bilby.core.prior.PowerLaw("
+    "alpha=2.0, minimum=100.0, maximum=1000.0, name='luminosity_distance')"
+}
+
+
+def _seeded_result(n=30, seed=42):
+    np.random.seed(seed)
+    bilby_random.seed(seed)
+    return make_gw_result(n=n)
+
+
+def _ld_log_prior_delta(result):
+    """Per-sample change in total ln-prior under _LD_PRIOR_UPDATE: only the
+    luminosity-distance factor changes, so the delta is its ln-prob difference."""
+    ld = result.samples["luminosity_distance"].to_numpy()
+    new = PowerLaw(alpha=2.0, minimum=100.0, maximum=1000.0)
+    old = Uniform(minimum=100.0, maximum=1000.0)
+    return new.ln_prob(ld) - old.ln_prob(ld)
+
+
+def test_update_prior_updates_prior_and_records_string_form():
+    result = _seeded_result()
+    training_ld = result.prior["luminosity_distance"]
+    assert isinstance(training_ld, Uniform)
+
+    prior_update = dict(_LD_PRIOR_UPDATE)
+    result.update_prior(prior_update)
+    # The caller's dict keeps its string form (update_prior copies before
+    # bilby's in-place instantiation).
+    assert prior_update == _LD_PRIOR_UPDATE
+
+    # The live prior is evolved.
+    assert isinstance(result.prior["luminosity_distance"], PowerLaw)
+    # The update is recorded in its original string-instantiable form, and
+    # PriorDict(prior_update) reconstructs exactly the evolved prior (the round
+    # trip _build_prior performs when a saved Result is reloaded).
+    stored = result.importance_sampling_metadata["prior_update"]
+    assert stored == _LD_PRIOR_UPDATE
+    reconstructed = PriorDict(stored.copy())
+    assert reconstructed["luminosity_distance"] == result.prior["luminosity_distance"]
+    assert reconstructed["luminosity_distance"] != training_ld
+
+
+def test_update_prior_reweights_samples_before_importance_sampling():
+    # Before importance sampling (log_evidence is None), update_prior stores
+    # weights proportional to exp(log_prior_new - log_prior_old).
+    result = _seeded_result()
+    assert result.log_evidence is None
+    param_keys = [k for k, v in result.prior.items() if not isinstance(v, Constraint)]
+    # ln-prior of the samples under the training prior, evaluated exactly as
+    # update_prior does internally (same PriorDict instance, so the stochastic
+    # constraint-normalization factor is cached and cancels in differences).
+    log_prior_before = result.prior.ln_prob(result.samples[param_keys], axis=0)
+
+    result.update_prior(dict(_LD_PRIOR_UPDATE))
+
+    delta = _ld_log_prior_delta(result)
+    # The log_prior column reflects the evolved prior: it shifts by exactly the
+    # luminosity-distance ln-prob difference.
+    np.testing.assert_allclose(
+        result.samples["log_prior"].to_numpy() - log_prior_before, delta, rtol=1e-8
+    )
+    # Weights are the normalized (mean 1) exponential of that shift -- and the
+    # update genuinely reweights (the PowerLaw is not flat over the samples).
+    expected = np.exp(delta - delta.max())
+    expected /= expected.mean()
+    weights = result.samples["weights"].to_numpy()
+    np.testing.assert_allclose(weights, expected, rtol=1e-8)
+    assert weights.mean() == pytest.approx(1.0)
+    assert weights.std() > 0.1
+
+
+def test_update_prior_reweights_importance_sampled_result():
+    # After importance sampling (log_evidence set), update_prior recomputes the
+    # weights and evidence. The importance-sampled state is fabricated from the
+    # sample columns (_calculate_evidence only reads log_prob / log_likelihood /
+    # log_prior), so no likelihood evaluation is needed.
+    result = _seeded_result()
+    param_keys = [k for k, v in result.prior.items() if not isinstance(v, Constraint)]
+    result.samples["log_prior"] = result.prior.ln_prob(
+        result.samples[param_keys], axis=0
+    )
+    result.samples["log_likelihood"] = np.random.default_rng(0).normal(
+        0.0, 1.0, len(result.samples)
+    )
+    result._calculate_evidence()
+    assert result.log_evidence is not None
+    weights_before = result.samples["weights"].to_numpy().copy()
+    log_evidence_before = result.log_evidence
+
+    result.update_prior(dict(_LD_PRIOR_UPDATE))
+
+    # New weights are the old ones tilted by exp(delta log-prior), renormalized;
+    # the evidence is recomputed accordingly.
+    expected = weights_before * np.exp(_ld_log_prior_delta(result))
+    expected /= expected.mean()
+    np.testing.assert_allclose(
+        result.samples["weights"].to_numpy(), expected, rtol=1e-8
+    )
+    assert result.log_evidence != log_evidence_before
+    assert np.isfinite(result.log_evidence)
+
+
+def test_update_prior_round_trips_through_file(tmp_path):
+    # A reloaded Result rebuilds the *evolved* prior, not the training prior:
+    # _build_prior re-applies importance_sampling_metadata["prior_update"] on top
+    # of the context's static prior.
+    result = _seeded_result()
+    training_ld = result.prior["luminosity_distance"]
+    result.update_prior(dict(_LD_PRIOR_UPDATE))
+    file_name = str(tmp_path / "result.hdf5")
+    result.to_file(file_name=file_name)
+
+    reloaded = Result(file_name=file_name)
+    assert reloaded.importance_sampling_metadata["prior_update"] == _LD_PRIOR_UPDATE
+    assert isinstance(reloaded.prior["luminosity_distance"], PowerLaw)
+    assert reloaded.prior["luminosity_distance"] == result.prior["luminosity_distance"]
+    assert reloaded.prior["luminosity_distance"] != training_ld
+    # The reweighted samples survive the round trip alongside the evolved prior.
+    np.testing.assert_allclose(
+        reloaded.samples["weights"].to_numpy(),
+        result.samples["weights"].to_numpy(),
+        rtol=1e-12,
+    )
+
+
+# ---------------------------------------------------------------------------
+# calibration sampling (sample_proposal_extensions)
+# ---------------------------------------------------------------------------
+
+
+def _write_envelope(path):
+    """Write a minimal LVC-format calibration envelope file.
+
+    Columns: frequency, median-amp, median-phase, -1sigma-amp, -1sigma-phase,
+    +1sigma-amp, +1sigma-phase. At least 4 rows are needed (cubic spline), spanning
+    the domain's [f_min, f_max].
+    """
+    freqs = np.geomspace(15.0, 300.0, 8)
+    data = np.column_stack(
+        [
+            freqs,
+            np.ones_like(freqs),  # median amplitude ~ 1
+            np.zeros_like(freqs),  # median phase ~ 0
+            np.full_like(freqs, 0.99),  # -1 sigma amplitude
+            np.full_like(freqs, -0.01),  # -1 sigma phase
+            np.full_like(freqs, 1.01),  # +1 sigma amplitude
+            np.full_like(freqs, 0.01),  # +1 sigma phase
+        ]
+    )
+    np.savetxt(path, data)
+
+
+def _calibration_kwargs(tmp_path, correction_type="data", num_nodes=5):
+    envelopes = {}
+    for ifo in DETECTORS:
+        path = tmp_path / f"{ifo}.txt"
+        _write_envelope(path)
+        envelopes[ifo] = str(path)
+    return {
+        "calibration_envelope": envelopes,
+        "num_calibration_nodes": num_nodes,
+        "correction_type": correction_type,
+    }
+
+
+def test_calibration_sampling_adds_recalib_columns(tmp_path):
+    result = make_gw_result()
+    log_prob_before = result.samples["log_prob"].to_numpy().copy()
+    n_nodes = 5
+
+    result.sample_proposal_extensions(
+        calibration_sampling_kwargs=_calibration_kwargs(tmp_path, num_nodes=n_nodes)
+    )
+
+    # Amplitude, phase and (fixed) frequency per node and detector.
+    recalib_cols = [c for c in result.samples.columns if c.startswith("recalib_")]
+    assert len(recalib_cols) == 3 * n_nodes * len(DETECTORS)
+    # The calibration prior log_prob is folded into the proposal log_prob.
+    assert not np.array_equal(result.samples["log_prob"].to_numpy(), log_prob_before)
+    # The calibration priors are recorded for persistence and added to the prior.
+    assert len(result.importance_sampling_metadata["prior_update"]) == len(recalib_cols)
+    assert any("recalib" in key for key in result.prior.keys())
+
+
+def test_calibration_sampling_invalid_correction_type():
+    result = make_gw_result()
+    # Parsed before any envelope file is read, so no files are needed.
+    with pytest.raises(ValueError, match="not understood"):
+        result.sample_proposal_extensions(
+            calibration_sampling_kwargs={"correction_type": "bogus"}
+        )
+
+
+@pytest.mark.parametrize(
+    "correction_type",
+    ["data", "template", {"H1": "data", "L1": "template"}, None],
+)
+def test_calibration_sampling_correction_type_variants(tmp_path, correction_type):
+    result = make_gw_result()
+    result.sample_proposal_extensions(
+        calibration_sampling_kwargs=_calibration_kwargs(
+            tmp_path, correction_type=correction_type
+        )
+    )
+    assert any(c.startswith("recalib_") for c in result.samples.columns)
+
+
+def test_calibration_sampling_nodes_span_event_range(tmp_path):
+    # The calibration nodes follow the event's per-detector analysis range (the
+    # range the likelihood masks its ASDs to), as Bilby's do, not the domain bounds.
+    from bilby.gw.prior import CalibrationPriorDict
+
+    event_metadata = {
+        "minimum_frequency": {"H1": 30.0, "L1": 25.0},
+        "maximum_frequency": 200.0,
+    }
+    result = make_gw_result(event_metadata=event_metadata)
+    n_nodes = 5
+    kwargs = _calibration_kwargs(tmp_path, num_nodes=n_nodes)
+    result.sample_proposal_extensions(calibration_sampling_kwargs=kwargs)
+    for ifo in DETECTORS:
+        expected = CalibrationPriorDict.from_envelope_file(
+            kwargs["calibration_envelope"][ifo],
+            event_metadata["minimum_frequency"][ifo],
+            event_metadata["maximum_frequency"],
+            n_nodes,
+            ifo,
+            correction_type="data",
+        )
+        for i in range(n_nodes):
+            for quantity in ("amplitude", "phase"):
+                name = f"recalib_{ifo}_{quantity}_{i}"
+                assert result.prior[name].mu == expected[name].mu
+                assert result.prior[name].sigma == expected[name].sigma
+
+
+def test_likelihood_checks_the_recorded_calibration_nodes(tmp_path):
+    # The node frequencies (fixed parameters of the prior) survive a round trip and
+    # match the likelihood's frequency range; a mismatch raises.
+    event_metadata = {"minimum_frequency": {"H1": 30.0, "L1": 25.0}}
+    result = make_gw_result(event_metadata=event_metadata)
+    result.sample_proposal_extensions(
+        calibration_sampling_kwargs=_calibration_kwargs(tmp_path)
+    )
+    file_name = str(tmp_path / "result.hdf5")
+    result.to_file(file_name=file_name)
+    reloaded = Result(file_name=file_name)
+    reloaded._build_likelihood()
+
+    reloaded.prior["recalib_H1_frequency_0"].peak *= 1.01
+    with pytest.raises(ValueError, match="calibration nodes for H1"):
+        reloaded._build_likelihood()
+
+
+def test_likelihood_skips_the_node_check_for_results_without_nodes(tmp_path):
+    # Results from earlier Dingo versions stored no node frequencies in the prior.
+    result = make_gw_result()
+    result.sample_proposal_extensions(
+        calibration_sampling_kwargs=_calibration_kwargs(tmp_path)
+    )
+    prior_update = result.importance_sampling_metadata["prior_update"]
+    for key in [k for k in prior_update if "_frequency_" in k]:
+        del prior_update[key]
+    file_name = str(tmp_path / "result.hdf5")
+    result.to_file(file_name=file_name)
+    reloaded = Result(file_name=file_name)
+    assert "recalib_H1_frequency_0" not in reloaded.prior
+    reloaded._build_likelihood()
+
+
+def test_update_prior_keeps_the_calibration_priors(tmp_path):
+    # update_prior merges into the recorded prior_update, so the calibration priors
+    # stay in the target prior after a reload. It also leaves out the fixed node
+    # frequencies when evaluating the prior, so the evidence stays consistent.
+    result = make_gw_result()
+    result.sample_proposal_extensions(
+        calibration_sampling_kwargs=_calibration_kwargs(tmp_path)
+    )
+    result.importance_sample()
+    log_evidence = result.log_evidence
+    recorded = dict(result.importance_sampling_metadata["prior_update"])
+    result.update_prior(dict(_LD_PRIOR_UPDATE))
+    assert abs(result.log_evidence - log_evidence) < 10
+    assert result.importance_sampling_metadata["prior_update"] == {
+        **recorded,
+        **_LD_PRIOR_UPDATE,
+    }
+    file_name = str(tmp_path / "result.hdf5")
+    result.to_file(file_name=file_name)
+    reloaded = Result(file_name=file_name)
+    assert all(key in reloaded.prior for key in recorded)
+
+
+def test_reset_event_with_wider_data_gives_the_likelihood_the_recorded_grid():
+    # The importance-sampling stage hands the Result an event dataset generated for
+    # a wider range; the Result's context builds the likelihood on the recorded
+    # grid while its own domain stays the network's.
+    from dingo.gw.data.event_dataset import EventDataset
+    from dingo.gw.inference.context import GWSamplerContext
+
+    result = make_gw_result(event_metadata={"domain": DOMAIN_SETTINGS})
+    wide = UniformFrequencyDomain(20.0, 512.0, 0.5)
+    mask = wide.frequency_mask
+    data = {
+        "waveform": {d: np.where(mask, (1.0 + 1j) * 1e-21, 0.0) for d in DETECTORS},
+        "asds": {d: np.where(mask, 1e-21, 1.0) for d in DETECTORS},
+    }
+    settings = {"domain": wide.domain_dict, "maximum_frequency": 512.0}
+    result.reset_event(EventDataset(dictionary={"data": data, "settings": settings}))
+    assert result.event_metadata == settings
+    assert result.domain.f_max == DOMAIN_SETTINGS["f_max"]
+    likelihood = result.sampler_context.likelihood(
+        use_base_domain=result.use_base_domain
+    )
+    assert likelihood.data_domain == wide
+    assert likelihood.waveform_generator.domain.f_max >= 512.0
+    # The record the samples were drawn under survives; with the sampling-time
+    # data (which the Result does not keep) it rebuilds the proposal's context.
+    proposal_record = result.importance_sampling_metadata["proposal_event_metadata"]
+    assert proposal_record == {"domain": DOMAIN_SETTINGS}
+    proposal = GWSamplerContext.from_model_metadata(
+        result.base_metadata, _context(), proposal_record
+    )
+    assert proposal.likelihood().data_domain == result.domain
+
+
+def test_old_schema_settings_are_converted_on_load():
+    # A Result written by the dingo-t1 branch carries the old tokenization keys and
+    # no normalize_position; reconstruction runs the converters, as the model
+    # loaders do for checkpoints, so the context can be rebuilt.
+    settings = _metadata()
+    settings["train_settings"]["data"]["tokenization"] = {"num_tokens": 8}
+    result = Result(
+        dictionary={
+            "samples": make_gw_result().samples,
+            "context": _context(),
+            "event_metadata": {},
+            "settings": settings,
+        }
+    )
+    tokenization = result.settings["train_settings"]["data"]["tokenization"]
+    assert tokenization == {"num_tokens_per_block": 8, "normalize_position": False}
+    waveform, position, token_mask = result.sampler_context.prepared_data()
+    assert position.shape == (2 * 8, 3)
+
+
+def test_calibration_and_synthetic_phase_run_as_one_chain(tmp_path):
+    # Calibration is drawn first in the chain, so the synthetic phase is conditioned
+    # on it: log_prob = stored + calibration prior + log q(phase | theta, recalib).
+    from dingo.gw.inference.steps import SyntheticPhaseFactor
+    import torch
+
+    bilby_random.seed(0)
+    np.random.seed(0)
+    result = make_gw_result(n=6, drop_phase=True)
+    # One sample outside the prior, which is skipped and carries zero weight.
+    result.samples.loc[5, "theta_jn"] = -1.0
+    log_prob_before = result.samples["log_prob"].to_numpy().copy()
+    theta_keys = [k for k, v in result.prior.items() if not isinstance(v, Constraint)]
+
+    kwargs = {"n_grid_phase": 64, "approximation_22_mode": True}
+    result.sample_proposal_extensions(
+        calibration_sampling_kwargs=_calibration_kwargs(tmp_path),
+        synthetic_parameters_kwargs=kwargs,
+    )
+
+    recalib = [c for c in result.samples.columns if c.startswith("recalib_")]
+    assert recalib and "phase" in result.prior and result.phase_prior is None
+    assert all(c in result.prior for c in recalib)
+
+    inside = result.samples.iloc[:5]
+    assert np.isnan(result.samples.loc[5, "log_prob"])
+    assert (result.samples.loc[5, recalib + ["phase"]] == 0.0).all()
+
+    # The fixed node frequencies contribute nothing to the proposal density.
+    calibration_prior = PriorDict({k: result.prior[k] for k in recalib})
+    sampled = calibration_prior.non_fixed_keys
+    log_q_calibration = calibration_prior.ln_prob(inside[sampled], axis=0)
+    factor = SyntheticPhaseFactor(
+        conditioning=theta_keys + recalib, n_grid_phase=64, approximation_22_mode=True
+    )
+    given = {k: torch.as_tensor(inside[k].to_numpy()) for k in theta_keys + recalib}
+    log_q_phase = factor.log_prob(
+        {"phase": torch.as_tensor(inside["phase"].to_numpy())},
+        result.sampler_context,
+        given,
+    ).numpy()
+    np.testing.assert_allclose(
+        inside["log_prob"].to_numpy(),
+        log_prob_before[:5] + log_q_calibration + log_q_phase,
+        rtol=1e-5,
+    )
+
+    # The phase distribution depends on the drawn calibration.
+    given_uncalibrated = {k: given[k] for k in theta_keys}
+    log_q_phase_uncalibrated = (
+        SyntheticPhaseFactor(
+            conditioning=theta_keys, n_grid_phase=64, approximation_22_mode=True
+        )
+        .log_prob(
+            {"phase": torch.as_tensor(inside["phase"].to_numpy())},
+            result.sampler_context,
+            given_uncalibrated,
+        )
+        .numpy()
+    )
+    assert not np.allclose(log_q_phase, log_q_phase_uncalibrated)
+
+    # Importance sampling gives the out-of-prior sample zero weight.
+    result.importance_sample()
+    weights = result.samples["weights"].to_numpy()
+    assert np.isfinite(result.log_evidence)
+    assert weights[5] == 0.0 and np.all(weights[:5] > 0)
+
+
+@pytest.mark.parametrize("drop_psi", [False, True])
+def test_synthetic_phase_22_cache_matches_direct_importance_sampling(drop_psi):
+    # For a model whose phase shift is a global exp(2i phase) factor, the (2, 2)
+    # path is exact, so the synthetic phase caches its log likelihood and
+    # importance sampling reuses it, for the phase alone and together with psi.
+    # IMRPhenomD is (2, 2)-only, hence exact in either spin convention.
+    result = make_gw_result(drop_phase=True, drop_psi=drop_psi)
+    assert result.sampler_context.likelihood().waveform_generator.phase_is_global_factor
+    bilby_random.seed(0)
+    result.sample_proposal_extensions(
+        synthetic_parameters_kwargs={"n_grid_phase": 64, "approximation_22_mode": True}
+    )
+    cached = result.samples["log_likelihood_cache"].to_numpy()
+    assert np.all(np.isfinite(cached))
+
+    result.importance_sample()
+    np.testing.assert_allclose(result.samples["log_likelihood"], cached)
+
+    # And the cached values are the likelihood, not just the profile.
+    result._build_likelihood()
+    theta = result.samples[
+        [k for k, v in result.prior.items() if not isinstance(v, Constraint)]
+    ]
+    direct = result.likelihood.log_likelihood_multi(theta)
+    np.testing.assert_allclose(cached, direct, rtol=1e-9)
+
+
+@pytest.mark.parametrize(
+    "waveform_generator, approximation_22_mode, caches, intrinsic_prior",
+    [
+        # Networks trained with a fixed spin convention, as before this change. For a
+        # precessing model the (2, 2) path is then approximate, so nothing is cached;
+        # the mode sum is exact through the DFT decomposition and is.
+        (WAVEFORM_GENERATOR_DFT, True, False, INTRINSIC_PRIOR),
+        (WAVEFORM_GENERATOR_DFT, False, True, INTRINSIC_PRIOR),
+        # An aligned (2, 2)-only model has no in-plane spins to leave behind, so it is
+        # exact in either convention.
+        (
+            {"approximant": "IMRPhenomD", "f_ref": 20.0, "spin_conversion_phase": 0.0},
+            True,
+            True,
+            INTRINSIC_PRIOR,
+        ),
+        (
+            {"approximant": "IMRPhenomD", "f_ref": 20.0, "spin_conversion_phase": None},
+            True,
+            True,
+            INTRINSIC_PRIOR,
+        ),
+        # Networks trained in Bilby's convention: exact on the (2, 2) path for a single
+        # co-precessing pair, and not for higher modes.
+        (WAVEFORM_GENERATOR_BNS, True, True, BNS_PRECESSING_PRIOR),
+        (
+            {
+                "approximant": "IMRPhenomXPHM",
+                "f_ref": 20.0,
+                "spin_conversion_phase": None,
+            },
+            True,
+            False,
+            INTRINSIC_PRIOR,
+        ),
+        # The same model on aligned spins fails the probe, so nothing is cached.
+        (WAVEFORM_GENERATOR_BNS, True, False, BNS_ALIGNED_PRIOR),
+    ],
+)
+@pytest.mark.filterwarnings("ignore:.*is not cached")
+def test_cache_decision_per_network(
+    waveform_generator, approximation_22_mode, caches, intrinsic_prior
+):
+    """The synthetic phase caches its log likelihood exactly where the phase dependence
+    is exact, and the decision follows from the network's own waveform settings."""
+    result = make_gw_result(
+        drop_phase=True,
+        waveform_generator=waveform_generator,
+        intrinsic_prior=intrinsic_prior,
+    )
+    step = result._synthetic_parameters_step(
+        {"n_grid_phase": 16, "approximation_22_mode": approximation_22_mode},
+        conditioning=list(result.prior),
+        num_samples=100,
+    )
+    assert step.cache_log_likelihood is caches
+
+
+def test_failed_probe_warns_and_skips_the_cache():
+    # A failed probe (here IMRPhenomXP on aligned spins) does not stop the run: it
+    # warns, caches nothing, and importance sampling evaluates the likelihood.
+    result = make_gw_result(
+        drop_phase=True,
+        waveform_generator=WAVEFORM_GENERATOR_BNS,
+        intrinsic_prior=BNS_ALIGNED_PRIOR,
+    )
+    with pytest.warns(UserWarning, match="is not cached"):
+        result.sample_proposal_extensions(
+            synthetic_parameters_kwargs={"approximation_22_mode": True}
+        )
+    assert "log_likelihood_cache" not in result.samples
+    result.importance_sample()
+    assert np.all(np.isfinite(result.samples["log_likelihood"]))
+
+
+def test_nan_probe_warns_and_skips_the_cache(monkeypatch):
+    # A NaN waveform fails the probe like any other disagreement.
+    import dingo.gw.inference.steps as steps
+
+    monkeypatch.setattr(steps, "_phase_global_factor_mismatch", lambda *args: np.nan)
+    result = make_gw_result(drop_phase=True)  # IMRPhenomD: cached otherwise
+    with pytest.warns(UserWarning, match="mismatch of nan"):
+        step = result._synthetic_parameters_step(
+            {"approximation_22_mode": True}, [], num_samples=100
+        )
+    assert not step.cache_log_likelihood
