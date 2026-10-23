@@ -7,17 +7,18 @@ import math
 from dingo.core.nn.enets import DenseResidualNet
 from dingo.core.utils import torchutils
 import copy
-from vector_copula_vi import AmortizedVectorCopulaFlow,DingoVectorCopulaFlow
+from vector_copula_vi import AmortizedVectorCopulaFlow,DingoVectorCopulaFlow,AmortizedMixtureVectorCopulaFlow
 
-class CopulaNSFFlowWrapper(nn.Module):
+class CopulaNSFFlowWrapper(nn.Module): 
     """
     similar to flowrapper, but for multiple flows
     """
     # TODO:: extend to N signals
-    def __init__(self, posterior_kwargs, embedding_kwargs, initial_weights=None):
+    def __init__(self, posterior_kwargs, embedding_kwargs, initial_weights=None, isEllipticalCopula:bool = False):
         super().__init__()
         
-        self.conditional = posterior_kwargs.get("conditional", True)
+        self.isEllipticalCopula = isEllipticalCopula
+        self.conditional        = posterior_kwargs.get("conditional", True)
         if "context_dim" not in posterior_kwargs:
             self.context_dim = None
         else:
@@ -61,17 +62,26 @@ class CopulaNSFFlowWrapper(nn.Module):
             self.copulaNet = CopulaParamNet(
                 self.context_dim,
                 self.D,
+                self.isEllipticalCopula,
                 **self.CopulaKwargs,
             )
-
-            self.vector_copula = AmortizedVectorCopulaFlow(
-                flows,
-                self.copulaNet,
-                marginal_backend="dingo",
-                is_independent = self.CopulaKwargs.get("is_independent", False)
-            )
+            if self.isEllipticalCopula:
+                self.vector_copula = AmortizedMixtureVectorCopulaFlow(
+                    flows,
+                    self.copulaNet,
+                    marginal_backend="dingo",
+                    is_independent = self.CopulaKwargs.get("is_independent", False)
+                )
+            else:    
+                self.vector_copula = AmortizedVectorCopulaFlow(
+                    flows,
+                    self.copulaNet,
+                    marginal_backend="dingo",
+                    is_independent = self.CopulaKwargs.get("is_independent", False)
+                )
 
         else:
+            #default to gaussian copula
             self.flows         = flows
             self.copulaNet     = None
             self.vector_copula = None
@@ -148,14 +158,25 @@ class CopulaParamNet(nn.Module):
             self,
             context_dim: int,
             D: int,  #sum of the blocs
+            isEllipticalCopula:bool = False,
             **CopulaKwargs
         ):
         super().__init__()
-        self.D           = D
-        self.P           = CopulaKwargs['P']
-        output_dim       = self.D*self.P + 1  #B iis a dxp matrix +1 for zeta
-        self.hidden_dims = CopulaKwargs['hidden_dims']
-        activation_fn    = torchutils.get_activation_function_from_string(CopulaKwargs['activation'])
+        self.D                  = D
+        self.P                  = CopulaKwargs['P']
+        self.isEllipticalCopula = isEllipticalCopula
+        self.hidden_dims        = CopulaKwargs['hidden_dims']
+        activation_fn           = torchutils.get_activation_function_from_string(CopulaKwargs['activation'])
+        
+        if self.isEllipticalCopula:
+            self.J                  = CopulaKwargs['J']
+            if self.J < 1:
+                raise ValueError("J must be at least 1.")
+            output_dim  = self.D*self.P + 2*self.J #self.D*self.P-> matrix + 1 -> zeta + self.J -> weights + (self.J - 1) -> scales
+        else:
+            output_dim  = self.D*self.P + 1  #B iis a dxp matrix +1 for zeta
+
+        
         
         self.net = DenseResidualNet(
             input_dim        = context_dim,
@@ -172,15 +193,27 @@ class CopulaParamNet(nn.Module):
     def forward(self, context):
         raw = self.net(context)
 
+        # Low-rank correlation parameters
         B_raw = raw[:, :self.D * self.P]
-
         z = raw[:, self.D * self.P]
 
-        B = B_raw.reshape(
-            -1,
-            self.D,
-            self.P,
-        )
+        B = B_raw.reshape(-1, self.D, self.P)
 
-        return B, z
+        if not self.isEllipticalCopula:
+            return B, z
+
+        # Elliptical mixture parameters
+        start = self.D * self.P + 1
+
+        raw_scale_gaps = raw[
+            :, start : start + self.J - 1
+        ]
+
+        start += self.J - 1
+
+        weight_logits = raw[
+            :, start : start + self.J
+        ]
+
+        return B, z, raw_scale_gaps, weight_logits
 

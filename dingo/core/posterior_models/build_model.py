@@ -42,7 +42,8 @@ def build_model_from_kwargs(
         "normalizing_flow": NormalizingFlowPosteriorModel,
         "flow_matching": FlowMatchingPosteriorModel,
         "score_matching": ScoreDiffusionPosteriorModel,
-        "copula_normalizing_flow" : CopulaNormalizingFlowModel
+        "copula_normalizing_flow" : CopulaNormalizingFlowModel,
+        "copula_ellips_normalizing_flow" : CopulaNormalizingFlowModel
     }
 
     if filename is not None:

@@ -1,6 +1,6 @@
 from .base_model import BasePosteriorModel
 from dingo.core.nn.copulaNSF import CopulaNSFFlowWrapper
-
+from dingo.core.nn.copulaEllipsNSF import copulaEllipsNSFWrapper
 # TODO: fix batching in copula's (now we have multiple events)
 class CopulaNormalizingFlowModel(BasePosteriorModel):
     """
@@ -20,13 +20,21 @@ class CopulaNormalizingFlowModel(BasePosteriorModel):
             
         posterior_kwargs = model_kwargs["posterior_kwargs"]
         embedding_kwargs = model_kwargs.get("embedding_kwargs", None)
-        
-        self.network = CopulaNSFFlowWrapper(
-            posterior_kwargs=posterior_kwargs,
-            embedding_kwargs=embedding_kwargs,
-            initial_weights=self.initial_weights
-        )
-        
+        if model_kwargs["posterior_model_type"] == "copula_normalizing_flow":
+            self.network = CopulaNSFFlowWrapper(
+                posterior_kwargs=posterior_kwargs,
+                embedding_kwargs=embedding_kwargs,
+                initial_weights=self.initial_weights
+            )
+        elif model_kwargs["posterior_model_type"] == "copula_ellips_normalizing_flow": 
+            self.network = copulaEllipsNSFWrapper(
+                posterior_kwargs=posterior_kwargs,
+                embedding_kwargs=embedding_kwargs,
+                initial_weights=self.initial_weights
+            )
+        else:
+            raise ValueError("Incorrect copula flow model given, choose: copula_normalizing_flow or copula_ellips_normalizing_flow")
+            
     def log_prob(self, theta, *context):
         """
         Parameters
