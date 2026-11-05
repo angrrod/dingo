@@ -668,6 +668,49 @@ def _build_grad_scaler(device: torch.device):
     return GradScaler(device_type)
 
 
+def _prepare_training_batch(pm, data):
+    """Optional GW preprocessing hook; other posterior models keep tensor batches."""
+    preprocessor = getattr(pm, "batch_preprocessor", None)
+    if preprocessor is not None:
+        # Preprocessing must not inherit network AMP or construct an autograd graph.
+        with torch.no_grad(), torch.autocast(device_type=torch.device(pm.device).type, enabled=False):
+            return preprocessor(data)
+    return [d.to(pm.device, non_blocking=True) for d in data]
+
+
+def _training_profiler(pm):
+    """Capture one scheduled CPU/CUDA window per process when explicitly enabled.
+
+    GW_PROFILE_GPU=1 enables tracing; GW_GPU_PROFILE_DIR selects the output
+    directory. Each rank writes its own trace and operator-time summary. The
+    schedule skips 20 batches, warms up for 3, and records 5 by default.
+    """
+    if os.environ.get("GW_PROFILE_GPU", "0") != "1" or getattr(pm, "_profile_captured", False):
+        return None
+    if torch.device(pm.device).type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("GW_PROFILE_GPU=1 requires a CUDA training device.")
+    directory = os.environ.get("GW_GPU_PROFILE_DIR", "gpu_profiles")
+    os.makedirs(directory, exist_ok=True)
+    rank = pm.rank if pm.rank is not None else 0
+    stem = f"job_{os.environ.get('SLURM_JOB_ID', 'local')}_rank_{rank}_epoch_{pm.epoch}"
+
+    def save_trace(prof):
+        prof.export_chrome_trace(join(directory, stem + ".json"))
+        with open(join(directory, stem + "_operators.txt"), "w") as output:
+            output.write(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
+        pm._profile_captured = True
+        print(f"GPU profiler trace saved: {join(directory, stem + '.json')}", flush=True)
+
+    return torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(
+            wait=int(os.environ.get("GW_GPU_PROFILE_WAIT", "20")),
+            warmup=3, active=5, repeat=1),
+        on_trace_ready=save_trace,
+        record_shapes=True, profile_memory=True, with_stack=True,
+    )
+
+
 def train_epoch(
     pm: BasePosteriorModel,
     dataloader: torch.utils.data.DataLoader,
@@ -723,49 +766,61 @@ def train_epoch(
 
     ddp_module = get_ddp_module(pm.network)
 
-    for batch_idx, data in enumerate(dataloader):
-        loss_info.update_timer("Dataloader")
+    profiler = _training_profiler(pm)
+    region = torch.profiler.record_function if profiler is not None else lambda name: nullcontext()
+    with profiler if profiler is not None else nullcontext():
+        for batch_idx, data in enumerate(dataloader):
+            loss_info.update_timer("Dataloader")
 
-        if batch_idx % gradient_updates_per_optimizer_step == 0:
-            pm.optimizer.zero_grad(set_to_none=True)
+            if batch_idx % gradient_updates_per_optimizer_step == 0:
+                pm.optimizer.zero_grad(set_to_none=True)
 
-        data = [d.to(pm.device, non_blocking=True) for d in data]
+            with region("preprocessing_and_transfer"):
+                data = _prepare_training_batch(pm, data)
 
-        is_step_batch = (batch_idx + 1) % gradient_updates_per_optimizer_step == 0
+            is_step_batch = (batch_idx + 1) % gradient_updates_per_optimizer_step == 0
 
-        # Under DDP, gradients only need to be all-reduced on the final backward
-        # pass of an accumulation window; skip the synchronization otherwise.
-        sync_ctx = (
-            ddp_module.no_sync()
-            if ddp_module is not None and not is_step_batch
-            else nullcontext()
-        )
+            # Under DDP, gradients only need to be all-reduced on the final backward
+            # pass of an accumulation window; skip the synchronization otherwise.
+            sync_ctx = (
+                ddp_module.no_sync()
+                if ddp_module is not None and not is_step_batch
+                else nullcontext()
+            )
 
-        # Gradients are summed over the accumulated mini-batches, so divide each
-        # loss by the number of accumulation steps to obtain the gradient of the
-        # mean loss over the effective batch (an unbiased estimate that does not
-        # grow with gradient_updates_per_optimizer_step).
-        with sync_ctx:
-            if automatic_mixed_precision:
-                with autocast(amp_device_type):
-                    loss = pm.loss(data[0], *data[1:])
-                scaler.scale(loss / gradient_updates_per_optimizer_step).backward()
-            else:
-                loss = pm.loss(data[0], *data[1:])
-                (loss / gradient_updates_per_optimizer_step).backward()
+            # Gradients are summed over the accumulated mini-batches, so divide each
+            # loss by the number of accumulation steps to obtain the gradient of the
+            # mean loss over the effective batch (an unbiased estimate that does not
+            # grow with gradient_updates_per_optimizer_step).
+            with sync_ctx:
+                if automatic_mixed_precision:
+                    with region("forward_and_loss"), autocast(amp_device_type):
+                        loss = pm.loss(data[0], *data[1:])
+                    with region("backward"):
+                        scaler.scale(loss / gradient_updates_per_optimizer_step).backward()
+                else:
+                    with region("forward_and_loss"):
+                        loss = pm.loss(data[0], *data[1:])
+                    with region("backward"):
+                        (loss / gradient_updates_per_optimizer_step).backward()
 
-        loss_info.cache_loss(loss=loss, n=len(data[0]))
+            loss_info.cache_loss(loss=loss, n=len(data[0]))
 
-        if is_step_batch:
-            if automatic_mixed_precision:
-                scaler.step(pm.optimizer)
-                scaler.update()
-            else:
-                pm.optimizer.step()
+            if is_step_batch:
+                if automatic_mixed_precision:
+                    with region("optimizer"):
+                        scaler.step(pm.optimizer)
+                        scaler.update()
+                else:
+                    with region("optimizer"):
+                        pm.optimizer.step()
 
-            loss_info.update()
-            if pm.rank is None or pm.rank == 0:
-                loss_info.print_info(batch_idx)
+                loss_info.update()
+                if pm.rank is None or pm.rank == 0:
+                    loss_info.print_info(batch_idx)
+
+            if profiler is not None:
+                profiler.step()
 
     return loss_info.get_avg(), loss_info.get_iteration()
 
@@ -836,7 +891,7 @@ def test_epoch(
         )
         for batch_idx, data in enumerate(dataloader):
             loss_info.update_timer()
-            data = [d.to(pm.device, non_blocking=True) for d in data]
+            data = _prepare_training_batch(pm, data)
             with amp_ctx:
                 loss = pm.loss(data[0], *data[1:])
             loss_info.cache_loss(loss, len(data[0]))

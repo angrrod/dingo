@@ -13,6 +13,7 @@ import glasflow.nflows.nn.nets as nflows_nets
 from dingo.core.utils import torchutils
 from dingo.core.nn.enets import create_enet_with_projection_layer_and_dense_resnet
 from dingo.core.nn.resnet import DenseResidualNet, check_norm_option
+from dingo.core.nn.lu import DeviceLULinear
 from typing import Union, Callable, Tuple, Optional
 
 
@@ -29,7 +30,7 @@ def create_linear_transform(param_dim: int):
     return transforms.CompositeTransform(
         [
             transforms.RandomPermutation(features=param_dim),
-            transforms.LULinear(param_dim, identity_init=True),
+            DeviceLULinear(param_dim, identity_init=True),
         ]
     )
 

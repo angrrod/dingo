@@ -106,6 +106,9 @@ def set_train_transforms(
         if omit_transforms is not None:
             print("Omitting \n\t" + "\n\t".join([t.__name__ for t in omit_transforms]))
 
+    # Stage rebuilds and embedding diagnostics always start with the CPU path.
+    wfd.defer_decompression = False
+
     # Build detector objects
     ifo_list = InterferometerList(data_settings["detectors"])
     ifo_names = [ifo.name for ifo in ifo_list]

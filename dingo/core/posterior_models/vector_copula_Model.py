@@ -12,6 +12,8 @@ class CopulaNormalizingFlowModel(BasePosteriorModel):
         super().__init__(**kwargs)
         
     def initialize_network(self):
+        isEllipticalCopula = self.model_kwargs["posterior_model_type"] == "copula_ellips_normalizing_flow"
+
         model_kwargs = {
             k: v for k, v in self.model_kwargs.items()
             if k != "posterior_model_type"
@@ -19,7 +21,6 @@ class CopulaNormalizingFlowModel(BasePosteriorModel):
             
         posterior_kwargs = model_kwargs["posterior_kwargs"]
         embedding_kwargs = model_kwargs.get("embedding_kwargs", None)
-        isEllipticalCopula = model_kwargs["posterior_model_type"] == "copula_ellips_normalizing_flow"
             
         self.network = CopulaNSFFlowWrapper(
             posterior_kwargs   = posterior_kwargs,

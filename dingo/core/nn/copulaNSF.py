@@ -184,7 +184,6 @@ class CopulaParamNet(nn.Module):
             hidden_dims      = CopulaKwargs['hidden_dims'],
             activation       = activation_fn,
             dropout          = CopulaKwargs['dropout'],
-            batch_norm       = CopulaKwargs['batch_norm'], #good to be on since copulas are affine invariant -> normalization removes these transforms
             context_features = None,
         )
         if self.P >= self.D:

@@ -220,6 +220,7 @@ def initialize_stage(
     rank: Optional[int] = None,
     resume: bool = False,
     drop_last: bool = False,
+    preprocessing_device: str = "cpu",
 ) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler]]:
     """
     Initializes training based on PosteriorModel metadata and current stage:
@@ -277,6 +278,15 @@ def initialize_stage(
         )
         print("Custom stage hook finished.")
     ######
+
+    if preprocessing_device not in ("cpu", "cuda"):
+        raise ValueError("local.preprocessing_device must be cpu or cuda.")
+    pm.batch_preprocessor = None
+    if preprocessing_device == "cuda":
+        if torch.device(pm.device).type != "cuda":
+            raise ValueError("CUDA preprocessing requires a CUDA training device.")
+        from dingo.gw.training.gpu_preprocessing import enable_gpu_preprocessing
+        pm.batch_preprocessor = enable_gpu_preprocessing(wfd).to(pm.device)
 
     # Convert total batch size and total number of workers to per-GPU values for
     # DDP. Each GPU process runs its own DataLoader.
@@ -412,6 +422,7 @@ def train_stages(
                 rank=rank,
                 resume=False,
                 drop_last=drop_last,
+                preprocessing_device=local_settings.get("preprocessing_device", "cpu"),
             )
         else:
             if print_primary:
@@ -426,6 +437,7 @@ def train_stages(
                 rank=rank,
                 resume=True,
                 drop_last=drop_last,
+                preprocessing_device=local_settings.get("preprocessing_device", "cpu"),
             )
 
         early_stopping = None

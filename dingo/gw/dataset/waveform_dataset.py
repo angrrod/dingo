@@ -316,7 +316,7 @@ class WaveformDataset(DingoDataset, torch.utils.data.Dataset):
         # inverse phase heterodyne) depend on the parameters. They must leave the
         # parameters untouched.
         data = {"parameters": parameters, "waveform": polarizations}
-        if self.decompression_transform is not None:
+        if self.decompression_transform is not None and not getattr(self, "defer_decompression", False):
             data = self.decompression_transform(data)
             if data["parameters"] is not parameters:
                 raise ValueError("Decompression transforms must not change parameters.")
