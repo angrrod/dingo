@@ -412,15 +412,22 @@ def build_svd_for_embedding_network(
     basis_dict = {}
     for ifo in ifos:
         basis = SVDBasis()
+        detector_start = time.time()
+        print(f'...{ifo}: starting SVD, shape='
+              f'{waveforms[ifo][:num_training_samples].shape}, rank={size}', flush=True)
         basis.generate_basis(waveforms[ifo][:num_training_samples], size)
         basis_dict[ifo] = basis
-        print(f"...{ifo} done.")
+        print(f'...{ifo} done in {time.time() - detector_start:.1f} s.', flush=True)
+        if out_dir is not None:
+            # Preserve the expensive basis even if diagnostics hit a time limit.
+            basis.to_file(os.path.join(out_dir, f"svd_{ifo}.hdf5"))
     print(f"...this took {time.time() - time_start:.0f} s.")
 
     if out_dir is not None:
         print(f"Testing SVD basis matrices.")
         for ifo, basis in basis_dict.items():
-            print(f"...{ifo}:")
+            validation_start = time.time()
+            print(f"...{ifo}: validating SVD", flush=True)
             basis.compute_test_mismatches(
                 waveforms[ifo][num_training_samples:],
                 parameters=parameters.iloc[num_training_samples:].reset_index(
@@ -428,6 +435,8 @@ def build_svd_for_embedding_network(
                 ),
                 verbose=True,
             )
+            print(f'...{ifo}: validation took '
+                  f'{time.time() - validation_start:.1f} s.', flush=True)
             basis.to_file(os.path.join(out_dir, f"svd_{ifo}.hdf5"))
     print("Done")
 

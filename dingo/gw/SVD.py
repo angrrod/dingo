@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import scipy
+import time
 from sklearn.utils.extmath import randomized_svd
 from dingo.core.dataset import DingoDataset
 
@@ -122,7 +123,7 @@ class SVDBasis(DingoDataset):
         verbose : bool
             Whether to print summary statistics.
         """
-        if len(data) != len(parameters):
+        if parameters is not None and len(data) != len(parameters):
             raise ValueError(
                 f"Incompatible data: len(data) == {len(data)} and len("
                 f"parameters) == {len(parameters)} do not match."
@@ -132,16 +133,31 @@ class SVDBasis(DingoDataset):
         else:
             self.mismatches = pd.DataFrame()
 
-        for n in np.append(np.arange(increment, self.n, increment), self.n):
-            mismatches = np.empty(len(data))
-            for i, d in enumerate(data):
-                compressed = d @ self.V[:, :n]
-                reconstructed = compressed @ self.Vh[:n]
-                norm1 = np.sqrt(np.sum(np.abs(d) ** 2))
-                norm2 = np.sqrt(np.sum(np.abs(reconstructed) ** 2))
-                inner = np.sum(d.conj() * reconstructed).real
-                mismatches[i] = 1 - inner / (norm1 * norm2)
-            self.mismatches[f"mismatch n={n}"] = mismatches
+        ranks = np.append(np.arange(increment, self.n, increment), self.n)
+        values = {n: np.empty(len(data)) for n in ranks}
+        started = time.perf_counter()
+        # Project each validation row once. Extend its reconstruction with the
+        # newly included basis vectors instead of repeating every lower rank.
+        # Bound full-frequency temporaries independently of validation-set size.
+        for start in range(0, len(data), 64):
+            stop = min(start + 64, len(data))
+            original = data[start:stop]
+            compressed = original @ self.V[:, :self.n]
+            reconstructed = np.zeros(original.shape, dtype=np.result_type(
+                original.dtype, self.V.dtype, self.Vh.dtype))
+            norm1 = np.sqrt(np.sum(np.abs(original) ** 2, axis=1))
+            previous = 0
+            for n in ranks:
+                reconstructed += compressed[:, previous:n] @ self.Vh[previous:n]
+                norm2 = np.sqrt(np.sum(np.abs(reconstructed) ** 2, axis=1))
+                inner = np.sum(original.conj() * reconstructed, axis=1).real
+                values[n][start:stop] = 1 - inner / (norm1 * norm2)
+                previous = n
+            if verbose:
+                print(f'SVD validation: {stop}/{len(data)} rows, '
+                      f'{time.perf_counter() - started:.1f} s elapsed', flush=True)
+        for n in ranks:
+            self.mismatches[f"mismatch n={n}"] = values[n]
 
         if verbose:
             self.print_validation_summary()

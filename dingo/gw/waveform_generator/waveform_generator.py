@@ -1,6 +1,7 @@
 from functools import partial
 from multiprocessing import Pool
 from math import isclose
+import time
 
 import numpy as np
 import astropy.units as u
@@ -1922,14 +1923,34 @@ def generate_waveforms_parallel(
     )
     task_data = parameter_samples.iterrows()
 
-    if pool is not None:
-        polarizations_list = pool.map(task_func, task_data)
-    else:
-        polarizations_list = list(map(task_func, task_data))
+    total = len(parameter_samples)
+    started = last_report = time.monotonic()
+    print(f'Waveform generation: starting {total:,} source waveforms', flush=True)
+    # Ordered iteration preserves alignment with parameter rows. Small chunks
+    # let the parent report progress without waiting for a large map chunk.
+    results = (pool.imap(task_func, task_data, chunksize=32) if pool is not None
+               else map(task_func, task_data))
+    polarizations_list = []
+    for completed, result in enumerate(results, 1):
+        polarizations_list.append(result)
+        now = time.monotonic()
+        if completed % 10000 == 0 or now - last_report >= 60 or completed == total:
+            elapsed = now - started
+            rate = completed / max(elapsed, 1e-9)
+            remaining = (total - completed) / rate
+            print(
+                f'Waveform generation: {completed:,}/{total:,} '
+                f'({100 * completed / total:.2f}%), {rate:.2f} waveforms/s, '
+                f'elapsed {elapsed / 3600:.2f} h, '
+                f'ETA {remaining / 3600:.2f} h for this source pass',
+                flush=True)
+            last_report = now
+    print('Waveform generation: stacking collected polarizations', flush=True)
     polarizations = {
         pol: np.stack([wf[pol] for wf in polarizations_list])
         for pol in polarizations_list[0].keys()
     }
+    print('Waveform generation: polarization stacking complete', flush=True)
     return polarizations
 
 

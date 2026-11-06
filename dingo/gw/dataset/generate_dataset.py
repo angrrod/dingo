@@ -3,7 +3,7 @@ import copy
 import textwrap
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from functools import partial
 
 import numpy as np
@@ -60,6 +60,8 @@ def generate_parameters_and_polarizations(
     polarization_blocks = {}
     failed_masks = []
     for suffix,parameters_split in splitted_params.items():
+        print(f'Generating source {suffix or "single"}: '
+              f'{len(parameters_split):,} parameter rows', flush=True)
         if num_processes > 1:
             #TODO: generate one pool and not num_processes for separate waveforms.
             with threadpool_limits(limits=1, user_api="blas"):
@@ -236,7 +238,8 @@ def train_svd_basis(dataset: WaveformDataset, size: int, n_train: int):
 
     return basis, n_train, n_test
 
-def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1) -> WaveformDataset:
+def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1,
+                     out_file=None, chunk_size=100000) -> Optional[WaveformDataset]:
     """
     Generate a waveform dataset.
 
@@ -246,12 +249,23 @@ def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1) ->
         Dictionary of settings to configure the dataset
     num_processes : int
     num_signals : int
+    out_file : str or Path, optional
+        If supplied, append bounded chunks to a resumable HDF5 file instead of
+        assembling the full dataset in memory. Returns None in this mode.
+    chunk_size : int
+        Number of joint rows per main-generation chunk (default 100,000).
 
     Returns
     -------
     A WaveformDataset based on the settings.
     """
 
+    resume_basis = None
+    if out_file is not None:
+        from dingo.gw.dataset.chunked_generation import cached_basis, completed_output
+        if completed_output(out_file, settings, num_signals):
+            return None
+        resume_basis = cached_basis(out_file, settings, num_signals)
     prior = build_prior_with_defaults(settings["intrinsic_prior"])
     domain = build_domain(settings["domain"])
 
@@ -305,7 +319,10 @@ def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1) ->
             svd_settings = settings["compression"]["svd"]
 
             # Load an SVD basis from file, if specified.
-            if "file" in svd_settings:
+            if resume_basis is not None:
+                print('Reusing storage SVD basis from partial dataset.', flush=True)
+                basis = SVDBasis(dictionary=resume_basis)
+            elif "file" in svd_settings:
                 basis = SVDBasis(file_name=svd_settings["file"])
 
             # Otherwise, generate the basis based on simulated waveforms.
@@ -349,6 +366,8 @@ def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1) ->
                 basis, n_train, n_test = train_svd_basis(
                     svd_dataset, svd_settings["size"], n_train
                 )
+                # Do not retain full-frequency SVD examples during main generation.
+                del svd_dataset, parameters, polarizations
 
             compression_transforms.append(ApplySVD(basis))
             dataset_dict["svd"] = basis.to_dictionary()
@@ -363,6 +382,11 @@ def generate_dataset(settings: Dict, num_processes: int, num_signals:int = 1) ->
         num_signals=num_signals
     )
     
+    if out_file is not None:
+        from dingo.gw.dataset.chunked_generation import write_chunks
+        write_chunks(out_file, dataset_dict, settings, num_signals, func, chunk_size)
+        return None
+
     parameters, polarizations = call_func_strict_output_dim(
         func,
         settings["num_samples"],
@@ -468,8 +492,9 @@ def _generate_dataset_main(
     with open(settings_file, "r") as f:
         settings = yaml.safe_load(f)
 
-    dataset = generate_dataset(settings, num_processes, num_signals = num_signals)
-    dataset.to_file(str(out_file))
+    generate_dataset(settings, num_processes, num_signals=num_signals,
+                     out_file=out_file,
+                     chunk_size=int(settings.get("generation", {}).get("chunk_size", 100000)))
 
 def main() -> None:
     args = parse_args()

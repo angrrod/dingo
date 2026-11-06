@@ -473,6 +473,7 @@ class BasePosteriorModel(ABC):
                     time.time(), device=self.device, dtype=torch.float64
                 )
 
+                self._gradient_log_path = join(train_dir, "gradient_diagnostics.jsonl")
                 train_loss, n_iter = train_epoch(
                     self,
                     dataloader=train_loader,
@@ -535,6 +536,7 @@ class BasePosteriorModel(ABC):
                                 "test_loss": test_loss,
                                 "train_time": train_time,
                                 "test_time": test_time,
+                                **getattr(self, "_gradient_epoch_metrics", {}),
                             }
                         )
                         print("\n=== EPOCH HOOK CHECK ===")
@@ -711,6 +713,40 @@ def _training_profiler(pm):
     )
 
 
+@torch.no_grad()
+def _gradient_diagnostics(network):
+    """Unscaled L2 norms by component; no parameter-sized diagnostic copies.
+
+    Ratios compare gradients to parameters, not actual Adam updates. Missing
+    gradients (including frozen layers) are counted explicitly.
+    """
+    groups = {name: {"grad": [], "weight": [], "with_grad": 0, "tensors": 0}
+              for name in ("projection", "embedding", "posterior")}
+    for name, parameter in network.named_parameters():
+        group = ("projection" if "layers_rb" in name else
+                 "embedding" if "embedding_net" in name else "posterior")
+        stats = groups[group]
+        stats["tensors"] += 1
+        stats["weight"].append(torch.linalg.vector_norm(parameter.detach()).double())
+        if parameter.grad is not None:
+            stats["with_grad"] += 1
+            stats["grad"].append(torch.linalg.vector_norm(parameter.grad.detach()).double())
+    metrics = {}
+    for group, stats in groups.items():
+        def combined(values):
+            return torch.linalg.vector_norm(torch.stack(values)).item() if values else 0.0
+        grad = combined(stats["grad"])
+        weight = combined(stats["weight"])
+        prefix = f"gradients/{group}"
+        metrics.update({f"{prefix}/l2": grad,
+                        f"{prefix}/parameter_l2": weight,
+                        f"{prefix}/grad_parameter_ratio": grad / max(weight, 1e-30),
+                        f"{prefix}/tensors_with_grad": stats["with_grad"],
+                        f"{prefix}/tensors": stats["tensors"],
+                        f"{prefix}/nonfinite": int(not np.isfinite(grad))})
+    return metrics
+
+
 def train_epoch(
     pm: BasePosteriorModel,
     dataloader: torch.utils.data.DataLoader,
@@ -765,6 +801,9 @@ def train_epoch(
             scaler = _build_grad_scaler(pm.device)
 
     ddp_module = get_ddp_module(pm.network)
+    gradient_log_every = int(os.environ.get("GW_GRAD_LOG_EVERY", "10"))
+    gradient_samples = []
+    optimizer_steps = 0
 
     profiler = _training_profiler(pm)
     region = torch.profiler.record_function if profiler is not None else lambda name: nullcontext()
@@ -807,6 +846,24 @@ def train_epoch(
             loss_info.cache_loss(loss=loss, n=len(data[0]))
 
             if is_step_batch:
+                log_gradients = (
+                    gradient_log_every > 0
+                    and optimizer_steps % gradient_log_every == 0
+                    and (pm.rank is None or pm.rank == 0))
+                if log_gradients:
+                    if automatic_mixed_precision:
+                        # scaler.step() recognizes the optimizer as already unscaled.
+                        scaler.unscale_(pm.optimizer)
+                    metrics = _gradient_diagnostics(pm.network)
+                    gradient_samples.append(metrics)
+                    record = {"epoch": pm.epoch, "batch_index": batch_idx,
+                              "optimizer_step_in_epoch": optimizer_steps,
+                              "loss": loss.detach().item(), **metrics}
+                    path = getattr(pm, "_gradient_log_path", None)
+                    if path is not None:
+                        with open(path, "a") as stream:
+                            stream.write(json.dumps(record) + "\n")
+                    print(f"Gradient diagnostics: {json.dumps(record)}", flush=True)
                 if automatic_mixed_precision:
                     with region("optimizer"):
                         scaler.step(pm.optimizer)
@@ -814,6 +871,7 @@ def train_epoch(
                 else:
                     with region("optimizer"):
                         pm.optimizer.step()
+                optimizer_steps += 1
 
                 loss_info.update()
                 if pm.rank is None or pm.rank == 0:
@@ -822,6 +880,12 @@ def train_epoch(
             if profiler is not None:
                 profiler.step()
 
+    pm._gradient_epoch_metrics = {}
+    if gradient_samples:
+        for key in gradient_samples[0]:
+            values = [sample[key] for sample in gradient_samples]
+            pm._gradient_epoch_metrics[f"{key}_mean"] = float(np.mean(values))
+            pm._gradient_epoch_metrics[f"{key}_max"] = float(np.max(values))
     return loss_info.get_avg(), loss_info.get_iteration()
 
 
