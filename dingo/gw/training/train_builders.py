@@ -303,6 +303,7 @@ def build_svd_for_embedding_network(
     num_workers: int = 0,
     batch_size: int = 1000,
     out_dir: Optional[str] = None,
+    checkpoint=None,
 ) -> List[np.ndarray]:
     """
     Construct SVD matrices V based on clean waveforms in each interferometer. These
@@ -326,6 +327,8 @@ def build_svd_for_embedding_network(
     batch_size : int
     out_dir : str
         SVD performance diagnostics are saved here.
+    checkpoint : EmbeddingSVDCache, optional
+        Persist initialization examples and atomically checkpoint each detector.
 
     Returns
     -------
@@ -362,55 +365,68 @@ def build_svd_for_embedding_network(
         ],
     )
 
-    print("Generating waveforms for embedding network SVD initialization.")
-    time_start = time.time()
-    ifos = list(wfd[0]["waveform"].keys())
-    waveform_len = len(wfd[0]["waveform"][ifos[0]])
-    num_waveforms = num_training_samples + num_validation_samples
-    if num_waveforms > len(wfd):
-        raise IndexError(
-            f"Requested {num_waveforms} samples for generating SVD for embedding "
-            f"network, but waveform dataset only contains {len(wfd)} samples."
-        )
-    waveforms = {
-        ifo: np.empty((num_waveforms, waveform_len), dtype=np.complex128)
-        for ifo in ifos
-    }
-    parameters = pd.DataFrame()
-
-    # num_workers is pinned to 0: worker processes corrupt the BLAS state and
-    # make scipy's SVD segfault (see PR #349 / issue #338).
-    loader = DataLoader(
-        wfd,
-        batch_size=batch_size,
-        num_workers=0,
-        worker_init_fn=fix_random_seeds,
-    )
-    with threadpool_limits(limits=1, user_api="blas"):
-        for idx, data in enumerate(loader):
-            # This is for handling the last batch, which may otherwise push the total
-            # number of samples above the number requested.
-            lower = idx * batch_size
-            n = min(batch_size, num_waveforms - lower)
-
-            parameters = pd.concat(
-                [parameters, pd.DataFrame(data["parameters"]).iloc[:n]],
-                ignore_index=True,
+    cached_examples = checkpoint.load_examples() if checkpoint is not None else None
+    if cached_examples is not None:
+        waveforms, parameters = cached_examples
+        ifos = list(waveforms)
+    else:
+        print("Generating waveforms for embedding network SVD initialization.")
+        time_start = time.time()
+        ifos = list(wfd[0]["waveform"].keys())
+        waveform_len = len(wfd[0]["waveform"][ifos[0]])
+        num_waveforms = num_training_samples + num_validation_samples
+        if num_waveforms > len(wfd):
+            raise IndexError(
+                f"Requested {num_waveforms} samples for generating SVD for embedding "
+                f"network, but waveform dataset only contains {len(wfd)} samples."
             )
-            strain_data = data["waveform"]
-            for ifo, strains in strain_data.items():
-                waveforms[ifo][lower : lower + n] = strains[:n]
-            if lower + n == num_waveforms:
-                break
-    print(f"...done. This took {time.time() - time_start:.0f} s.")
+        waveforms = {
+            ifo: np.empty((num_waveforms, waveform_len), dtype=np.complex128)
+            for ifo in ifos
+        }
+        parameters = pd.DataFrame()
 
+        # num_workers is pinned to 0: worker processes corrupt the BLAS state and
+        # make scipy's SVD segfault (see PR #349 / issue #338).
+        loader = DataLoader(
+            wfd,
+            batch_size=batch_size,
+            num_workers=0,
+            worker_init_fn=fix_random_seeds,
+        )
+        with threadpool_limits(limits=1, user_api="blas"):
+            for idx, data in enumerate(loader):
+                # This is for handling the last batch, which may otherwise push the total
+                # number of samples above the number requested.
+                lower = idx * batch_size
+                n = min(batch_size, num_waveforms - lower)
+
+                parameters = pd.concat(
+                    [parameters, pd.DataFrame(data["parameters"]).iloc[:n]],
+                    ignore_index=True,
+                )
+                strain_data = data["waveform"]
+                for ifo, strains in strain_data.items():
+                    waveforms[ifo][lower : lower + n] = strains[:n]
+                if lower + n == num_waveforms:
+                    break
+        print(f"...done. This took {time.time() - time_start:.0f} s.")
+
+        if checkpoint is not None:
+            checkpoint.save_examples(waveforms, parameters)
     # Reset the standard sharing strategy.
     torch.multiprocessing.set_sharing_strategy(old_sharing_strategy)
 
     print("Generating SVD basis for ifo:")
     time_start = time.time()
     basis_dict = {}
+    validated = {}
     for ifo in ifos:
+        saved = checkpoint.load_basis(ifo) if checkpoint is not None else None
+        if saved is not None:
+            basis_dict[ifo], validated[ifo] = saved
+            continue
+        validated[ifo] = False
         basis = SVDBasis()
         detector_start = time.time()
         print(f'...{ifo}: starting SVD, shape='
@@ -418,7 +434,9 @@ def build_svd_for_embedding_network(
         basis.generate_basis(waveforms[ifo][:num_training_samples], size)
         basis_dict[ifo] = basis
         print(f'...{ifo} done in {time.time() - detector_start:.1f} s.', flush=True)
-        if out_dir is not None:
+        if checkpoint is not None:
+            checkpoint.save_basis(ifo, basis)
+        elif out_dir is not None:
             # Preserve the expensive basis even if diagnostics hit a time limit.
             basis.to_file(os.path.join(out_dir, f"svd_{ifo}.hdf5"))
     print(f"...this took {time.time() - time_start:.0f} s.")
@@ -426,6 +444,9 @@ def build_svd_for_embedding_network(
     if out_dir is not None:
         print(f"Testing SVD basis matrices.")
         for ifo, basis in basis_dict.items():
+            if validated[ifo]:
+                print(f'...{ifo}: validation already complete, skipping.', flush=True)
+                continue
             validation_start = time.time()
             print(f"...{ifo}: validating SVD", flush=True)
             basis.compute_test_mismatches(
@@ -437,7 +458,10 @@ def build_svd_for_embedding_network(
             )
             print(f'...{ifo}: validation took '
                   f'{time.time() - validation_start:.1f} s.', flush=True)
-            basis.to_file(os.path.join(out_dir, f"svd_{ifo}.hdf5"))
+            if checkpoint is not None:
+                checkpoint.save_basis(ifo, basis, validated=True)
+            else:
+                basis.to_file(os.path.join(out_dir, f"svd_{ifo}.hdf5"))
     print("Done")
 
     # Return V matrices in standard order. Drop the elements below domain.min_idx,
